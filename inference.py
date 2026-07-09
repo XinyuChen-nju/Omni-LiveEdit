@@ -81,7 +81,9 @@ if args.checkpoint_path:
             fixed[k] = v
         pipeline.generator.load_state_dict(fixed, strict=False)
 
-pipeline = pipeline.to(dtype=torch.bfloat16)
+# H20 GPU: bf16 Linear causes SIGFPE. Use fp32 for compatibility.
+inference_dtype = torch.float32
+pipeline = pipeline.to(dtype=inference_dtype)
 if low_memory:
     DynamicSwapInstaller.install_model(pipeline.text_encoder, device=gpu)
 else:
@@ -179,7 +181,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
         initial_latent = None
         sampled_noise = torch.randn(
-            [1, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
+            [1, args.num_output_frames, 16, 60, 104], device=device, dtype=inference_dtype
         )
 
     sample_report_timing = args.report_timing and i >= 1

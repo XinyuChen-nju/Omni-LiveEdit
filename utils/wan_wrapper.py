@@ -12,8 +12,11 @@ from wan.modules.causal_model import CausalWanModel
 
 
 class WanTextEncoder(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, text_encoder_path: Optional[str] = None,
+                 tokenizer_path: Optional[str] = None) -> None:
         super().__init__()
+        text_encoder_path = text_encoder_path or "wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth"
+        tokenizer_path = tokenizer_path or "wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl"
 
         self.text_encoder = umt5_xxl(
             encoder_only=True,
@@ -22,12 +25,12 @@ class WanTextEncoder(torch.nn.Module):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load("wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+            torch.load(text_encoder_path,
                        map_location='cpu', weights_only=False)
         )
 
         self.tokenizer = HuggingfaceTokenizer(
-            name="wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name=tokenizer_path, seq_len=512, clean='whitespace')
 
     @property
     def device(self):
@@ -51,8 +54,9 @@ class WanTextEncoder(torch.nn.Module):
 
 
 class WanVAEWrapper(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, vae_path: Optional[str] = None):
         super().__init__()
+        vae_path = vae_path or "wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
             0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
@@ -66,7 +70,7 @@ class WanVAEWrapper(torch.nn.Module):
 
         # init model
         self.model = _video_vae(
-            pretrained_path="wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+            pretrained_path=vae_path,
             z_dim=16,
         ).eval().requires_grad_(False)
 
@@ -119,15 +123,17 @@ class WanDiffusionWrapper(torch.nn.Module):
             timestep_shift=8.0,
             is_causal=False,
             local_attn_size=-1,
-            sink_size=0
+            sink_size=0,
+            model_path: Optional[str] = None,
     ):
         super().__init__()
+        model_dir = model_path or f"wan_models/{model_name}/"
 
         if is_causal:
             self.model = CausalWanModel.from_pretrained(
-                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                model_dir, local_attn_size=local_attn_size, sink_size=sink_size)
         else:
-            self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
+            self.model = WanModel.from_pretrained(model_dir)
         self.model.eval()
 
         # For non-causal diffusion, all frames share the same timestep

@@ -83,9 +83,13 @@ def launch_distributed_job(backend: str = "nccl"):
         init_method = f"tcp://[{host}]:{port}"
     else:  # IPv4
         init_method = f"tcp://{host}:{port}"
-    dist.init_process_group(rank=rank, world_size=world_size, backend=backend,
-                            init_method=init_method, timeout=timedelta(minutes=30))
+    # 先绑定本 rank 的 GPU，再建 PG，并把 device_id 传给 init_process_group。
+    # 否则首个 barrier 会因 "devices used by this process are currently unknown" 靠 rank 猜设备，
+    # 跨机（多节点 NCCL）时这会带来握手挂起风险；显式 device_id 可消除该告警与隐患。
     torch.cuda.set_device(local_rank)
+    dist.init_process_group(rank=rank, world_size=world_size, backend=backend,
+                            init_method=init_method, timeout=timedelta(minutes=30),
+                            device_id=torch.device("cuda", local_rank))
 
 
 class EMA_FSDP:

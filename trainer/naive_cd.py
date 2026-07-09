@@ -11,6 +11,7 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 import torch
 import wandb
+from torch.utils.tensorboard import SummaryWriter
 import time
 import os
 from model import NaiveConsistency
@@ -54,6 +55,10 @@ class Trainer:
                 project=config.wandb_project,
                 dir=config.wandb_save_dir
             )
+
+        self.writer = None
+        if self.is_main_process and config.logdir:
+            self.writer = SummaryWriter(os.path.join(config.logdir, "tensorboard"))
 
         self.output_path = config.logdir
 
@@ -289,6 +294,9 @@ class Trainer:
 
                 if not self.disable_wandb:
                     wandb.log(wandb_loss_dict, step=self.step)
+                if self.writer is not None:
+                    for k, v in wandb_loss_dict.items():
+                        self.writer.add_scalar(k, v, self.step)
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:
@@ -303,4 +311,6 @@ class Trainer:
                 else:
                     if not self.disable_wandb:
                         wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                    if self.writer is not None:
+                        self.writer.add_scalar("per iteration time", current_time - self.previous_time, self.step)
                     self.previous_time = current_time

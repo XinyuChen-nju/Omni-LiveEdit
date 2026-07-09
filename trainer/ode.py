@@ -10,6 +10,7 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 import torch
 import wandb
+from torch.utils.tensorboard import SummaryWriter
 import time
 import os
 
@@ -52,6 +53,10 @@ class Trainer:
                 project=config.wandb_project,
                 dir=config.wandb_save_dir
             )
+
+        self.writer = None
+        if self.is_main_process and config.logdir:
+            self.writer = SummaryWriter(os.path.join(config.logdir, "tensorboard"))
 
         self.output_path = config.logdir
 
@@ -201,13 +206,17 @@ class Trainer:
         self.generator_optimizer.step()
 
         # Step 4: Logging
-        if self.is_main_process and not self.disable_wandb:
+        if self.is_main_process:
             wandb_loss_dict = {
                 "generator_loss": generator_loss.item(),
                 "generator_grad_norm": generator_grad_norm.item(),
                 **stats
             }
-            wandb.log(wandb_loss_dict, step=self.step)
+            if not self.disable_wandb:
+                wandb.log(wandb_loss_dict, step=self.step)
+            if self.writer is not None:
+                for k, v in wandb_loss_dict.items():
+                    self.writer.add_scalar(k, v, self.step)
 
         if self.step % self.config.gc_interval == 0:
             if dist.get_rank() == 0:
@@ -230,6 +239,8 @@ class Trainer:
                 else:
                     if not self.disable_wandb:
                         wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                    if self.writer is not None:
+                        self.writer.add_scalar("per iteration time", current_time - self.previous_time, self.step)
                     self.previous_time = current_time
 
             self.step += 1

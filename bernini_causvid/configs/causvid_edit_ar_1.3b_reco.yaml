@@ -1,0 +1,73 @@
+# Stage 1（AR teacher-forcing 编辑扩散），使用全量 ReCo 蒸馏集。
+# 与 causvid_edit_ar_1.3b.yaml 相同，只是 data_path 指向 4000 条 ReCo latents
+#（源视频 + 编辑后 GT 目标，由 tools/gen_edit_targets.py 编码）。
+
+# ---- 模型 / 骨架 -----------------------------------------------------------
+model_name: Bernini-R-1.3B
+model_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Bernini-R-1.3B
+text_encoder_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+vae_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+causal: true                      # 因果（单向）注意力，把双向 Bernini 改造成因果模型
+num_frame_per_block: 1            # 每个自回归块的帧数：逐帧(1) 或 分块(如 3)
+timestep_shift: 5.0               # flow-matching 时间步偏移s
+
+# ---- 文本条件缓存（工程加速）----------------------------------------------
+# true：使用 gen_text_embeds.py 预计算的 prompt embedding，训练时跳过每步的 umT5
+#       前向，并且不再把 umT5-xxl 文本编码器放到显存（省 ~11GB）。
+# 前置：必须先运行 bernini_causvid/tools/gen_text_embeds.py 给 index.json 补
+#       `text_embed` 字段；否则训练会报错。设为 false 可回退到训练时现算。
+cache_text_embeds: true
+
+# ---- teacher forcing -------------------------------------------------------
+teacher_forcing: true             # teacher forcing：用 GT 上下文喂入，稳定训练
+# 给 teacher-forcing 的 clean target 历史加“轻微”噪声做正则，缩小训练/推理 exposure-bias
+# （推理时历史是模型自生成、不完美）。取时间步值上界（0~1000，0=关闭）；每帧采 [0, 此值]
+# 的噪声水平，并把该水平作为 aug_t 喂给模型（与推理 context_noise 同义）。小值=轻微噪声。
+noise_augmentation_max_timestep: 100
+# 给 source（原视频）condition 加“轻微”噪声做正则，防止模型照抄源视频。取时间步值上界
+# （0~1000，0=关闭）；训练时每帧采 [0, 此值] 的噪声水平，含 0 → 干净源在分布内。
+# 由于 timesteps≈sigma*1000，此值≈最大噪声占比×1000：100 ≈ 最多 ~10% 噪声（均值 ~5%）。
+# 推理端 EditCausalInferencePipeline.source_noise 同义，建议推理设 0（干净源）。
+source_noise_max_timestep: 100
+num_train_timestep: 1000          # 扩散总时间步数
+denoising_loss_type: flow         # 去噪回归损失：flow（flow-matching）
+
+# ---- ReCo 区域强化 loss（latent 正则，arXiv:2512.17650）---------------------
+# 编辑区（GT 目标与源在 latent 上差异大的区域）在 flow loss 里加权，避免小编辑被
+# 大面积易复制背景淹没、梯度被稀释（导致后续帧编辑塌回源）。mask 逐帧由
+# |target-source| 现算。region_loss=false 时与原损失完全一致。
+region_loss: true                 # 总开关
+region_edit_weight: 4.0           # 编辑区额外权重：该区 loss 乘 (1+该值)
+region_mask_threshold: 0.10       # 归一化 src↔tgt 差异 > 该阈值判为编辑区（硬 mask）
+region_mask_soft: false           # false=硬 mask(0/1)；true=连续软权重(0~1)
+region_weight_normalize: true     # 逐帧把权重均值归一到 1，保持 loss 量级/学习率稳定
+
+# latent 视频几何 [B, F, C, H, W]，对应 480x832、81 帧（与源对齐）。
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+# ---- 优化 ------------------------------------------------------------------
+mixed_precision: true        # 混合精度（bf16）训练
+gradient_checkpointing: true # 梯度检查点：用计算换显存
+batch_size: 2                # 每卡 batch 大小
+gradient_accumulation_steps: 1 # 梯度累积步数：每个优化步累积多少 micro-batch（1=不累积；等效全局 batch ×该值，显存不变）
+lr: 1.0e-5                   # 学习率（Stage 1 用较大 1e-5）
+beta1: 0.9                   # Adam 一阶动量 β1
+beta2: 0.999                 # Adam 二阶动量 β2
+weight_decay: 0.0            # 权重衰减
+ema_weight: 0.0              # EMA 衰减系数（0=不用 EMA）
+ema_start_step: 0            # 第几步开始累计 EMA
+seed: 0                      # 随机种子
+
+# ---- 分布式 / FSDP（仅在用 torchrun 启动时生效）---------------------------
+sharding_strategy: hybrid_full
+
+# ---- 数据 ------------------------------------------------------------------
+# 全量 ReCo 蒸馏 latents（add/remove/replace 各约 33%，目标为 GT）。
+data_path: /apdcephfs_hzlf/share_1227201/xinyu/Dataset/ReCo/distill_for_bernini_v1-4000/edit_lat_full/index.json
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'

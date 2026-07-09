@@ -475,11 +475,16 @@ class T5EncoderModel:
         self,
         text_len,
         dtype=torch.bfloat16,
-        device=torch.cuda.current_device(),
+        device=None,
         checkpoint_path=None,
         tokenizer_path=None,
         shard_fn=None,
     ):
+        # NOTE: resolved lazily (not as a default arg) so importing this module
+        # does not require a CUDA device. Preserves prior behavior when a GPU is
+        # present (defaults to the current CUDA device).
+        if device is None:
+            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
         self.text_len = text_len
         self.dtype = dtype
         self.device = device

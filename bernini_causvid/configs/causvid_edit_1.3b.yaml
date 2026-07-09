@@ -1,0 +1,80 @@
+# 对 Bernini-R 1.3B 编辑模型做 CausVid 蒸馏 -> 少步因果学生。
+# 训练入口会把它合并在 configs/default_config.yaml 之上。
+
+# ---- 模型 / 骨架 -----------------------------------------------------------
+model_name: Bernini-R-1.3B        # 模型名称仅作标识；实际加载路径见 model_path
+model_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Bernini-R-1.3B
+text_encoder_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+vae_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+causal: true                      # 因果（单向）注意力，少步自回归生成必须开启
+num_frame_per_block: 3            # 每个自回归块的帧数：逐帧(1) 或 分块(如 3)
+timestep_shift: 5.0               # flow-matching 时间步偏移；越大越偏向高噪声端去噪
+
+# ---- 编辑 teacher（real_score）链式引导 -----------------------------------
+# v2v_apg = 2 次前向 + 在 x0 空间做 APG（与 Bernini 一致）；rv2v = 4 次前向链式引导；
+# v2v = 2 次前向普通 CFG。
+guidance_mode: v2v_apg            # teacher 引导模式：v2v_apg / v2v / rv2v / t2v
+guidance_scale: 3.0               # CFG 引导强度（teacher 评分时正/负条件的放大系数）
+omega_v: 1.25                     # 视频(源)条件的引导权重
+omega_i: 4.5                      # 编辑指令(instruction)条件的引导权重
+omega_ti: 4.0                     # 文本+指令联合条件的引导权重
+apg_eta: 0.5                      # APG：平行分量保留系数（仅 v2v_apg 生效，与 Bernini 默认一致）
+apg_norm_threshold: 50.0          # APG：条件差异的范数截断阈值（仅 v2v_apg 生效）
+
+# ---- DMD 蒸馏 --------------------------------------------------------------
+# Stage 2 初始化（CF++ causal_cd 或 causal_ode）。强烈建议设置：
+# DMD 是少步的，需要少步因果初始化，而不是原始的双向 Bernini 权重。
+# 留 null 则从转换后的权重开始。
+generator_ckpt: null              # 学生初始化权重；必须指向 Stage 2 产出（null 会直接报错）
+# 例如 runs/bernini_edit_cd/checkpoints/checkpoint_model_003000/model.pt
+allow_raw_bernini_init: false     # 安全开关：generator_ckpt 为空时是否允许从原始转换权重开始 DMD
+#                                 （默认 false=报错，避免误用双向权重做少步 DMD；确需时手动设 true）
+distribution_loss: dmd            # 分布匹配损失类型：dmd（Distribution Matching Distillation）
+denoising_loss_type: flow         # 去噪回归损失：flow（flow-matching）
+denoising_step_list:               # 学生少步推理调度（这里 4 步，从高噪声到低噪声）
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true         # 是否对去噪步做 timestep_shift 重映射（与训练/推理保持一致）
+ts_schedule: false                # 是否按训练进度动态调整 timestep 采样分布
+num_train_timestep: 1000          # 扩散总时间步数（噪声调度的离散粒度）
+dfake_gen_update_ratio: 5         # critic(fake_score) 更新次数 : generator 更新次数 = 5:1
+
+# latent 视频几何 [B, F, C, H, W]，对应 480x832、81 帧（与源对齐）。
+# 实际噪声形状在运行时取自每个样本的 source_latent。
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+# ---- 优化 ------------------------------------------------------------------
+mixed_precision: true        # 混合精度（bf16）训练，省显存提速
+gradient_checkpointing: true # 梯度检查点：用计算换显存（重算激活）
+batch_size: 1                # 每卡 batch 大小
+gradient_accumulation_steps: 1 # 梯度累积步数：generator 与 critic 各累积多少 micro-batch（1=不累积；等效全局 batch ×该值，显存不变）
+lr: 2.0e-06                  # generator（学生）学习率
+lr_critic: 4.0e-07           # critic（fake_score 判别器）学习率
+beta1: 0.0                   # generator Adam 一阶动量 β1
+beta2: 0.999                 # generator Adam 二阶动量 β2
+beta1_critic: 0.0            # critic Adam β1
+beta2_critic: 0.999          # critic Adam β2
+weight_decay: 0.0            # 权重衰减
+ema_weight: 0.99             # 学生权重 EMA 衰减系数（保存的 generator_ema 用它）
+ema_start_step: 200          # 第几步开始累计 EMA
+seed: 0                      # 随机种子
+
+# ---- 分布式 / FSDP（仅在用 torchrun 启动时生效）---------------------------
+# full = FULL_SHARD（单机）；hybrid_full = HYBRID_SHARD（节点内分片、节点间复制）
+# —— 多机推荐用 hybrid_full。generator / fake_score / text_encoder 各自被包成一个
+# FSDP 单元；real_score（链式引导 teacher）经 predict_real 进入，因此保持为复制的
+# bf16 模块。
+sharding_strategy: hybrid_full
+
+# ---- 数据 ------------------------------------------------------------------
+# 由 bernini_causvid/tools/gen_edit_targets.py 生成的 index.json
+data_path: data/edit_lat/index.json
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'

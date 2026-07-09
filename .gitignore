@@ -6,4 +6,24 @@ checkpoints
 output
 dataset
 prompts/vidprom_filtered_extended.txt
+logstemp/
+runs
+visual
+data
 logs
+temp
+
+# generated artifacts / model weights
+results/
+**/results/
+*.mp4
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.h5
+*.npz
+*.pth.tar
+*.pptx

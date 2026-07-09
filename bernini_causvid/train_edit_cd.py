@@ -1,0 +1,433 @@
+"""Stage 2 (Option B) trainer: Causal Consistency Distillation (Causal Forcing++).
+
+Distils the Stage 1 AR editing model into a few-step causal editing model using only
+GT (source + edited target) latents -- no ODE pair generation. The EMA of the student
+(`generator_ema`) is the deliverable causal_cd checkpoint that initialises Stage 3 DMD.
+
+Multi-node / multi-GPU (FSDP) -- run from the Causal-Forcing repo root:
+    torchrun --standalone --nproc_per_node=8 bernini_causvid/train_edit_cd.py \
+        --config bernini_causvid/configs/causvid_edit_cd_1.3b.yaml \
+        --logdir runs/bernini_edit_cd
+
+Single GPU (smoke / debug) still works without torchrun:
+    CUDA_VISIBLE_DEVICES=0 python bernini_causvid/train_edit_cd.py \
+        --config bernini_causvid/configs/causvid_edit_cd_1.3b.yaml \
+        --logdir runs/bernini_edit_cd
+"""
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+from datetime import datetime
+
+sys.path.insert(0, os.getcwd())
+
+import torch
+from omegaconf import OmegaConf
+from torch.utils.tensorboard import SummaryWriter
+from torchvision.io import write_video
+
+from bernini_causvid.models.edit_consistency import EditNaiveConsistency
+from bernini_causvid.data.edit_dataset import EditLatentDataset, edit_collate
+from bernini_causvid.train_common import Logger, append_jsonl, find_latest
+from bernini_causvid import dist_common as D
+from utils.dataset import cycle
+from utils.scheduler import FlowMatchScheduler
+
+
+# 编辑类型（增/删/改）由 prompt 首词区分：add=增、remove=删、replace=改。
+EDIT_KINDS = [("add", "增"), ("remove", "删"), ("replace", "改")]
+
+
+def _edit_kind(prompt):
+    """从指令文本里取出编辑类型首词（去掉前导 '*'、空白等噪声）。"""
+    toks = str(prompt).strip().lstrip("*").strip().split()
+    return toks[0].lower() if toks else ""
+
+
+def load_or_make_neg_embed(cfg, device, is_main):
+    """Return the fixed negative-prompt umT5 embedding as [1, L, D] (bf16, CPU).
+
+    Used when `cache_text_embeds` drops the umT5-xxl encoder from GPU: the single
+    negative prompt is encoded once and cached next to the data index as
+    `text_embeds/_negative_txt.pt`, so the ~11GB encoder is loaded at most once
+    ever (rank 0 only) and NEVER during steady-state training. Other ranks wait on
+    the barrier and read the cached file.
+    """
+    idx_dir = os.path.dirname(os.path.abspath(cfg.data_path))
+    neg_path = os.path.join(idx_dir, "text_embeds", "_negative_txt.pt")
+    if not os.path.exists(neg_path) and is_main:
+        os.makedirs(os.path.dirname(neg_path), exist_ok=True)
+        from utils.wan_wrapper import WanTextEncoder
+        te = WanTextEncoder(
+            text_encoder_path=getattr(cfg, "text_encoder_path", None),
+            tokenizer_path=getattr(cfg, "tokenizer_path", None)).to(device).eval()
+        with torch.no_grad():
+            emb = te(text_prompts=[cfg.negative_prompt])["prompt_embeds"][0]  # [L, D]
+        torch.save(emb.to(torch.bfloat16).contiguous().cpu(), neg_path)
+        del te
+        torch.cuda.empty_cache()
+    D.barrier()
+    emb = torch.load(neg_path, map_location="cpu")  # [L, D]
+    return emb.unsqueeze(0)  # [1, L, D]
+
+
+def select_eval_items(items, kinds):
+    """为每种编辑类型挑第一条样本，返回 {kind: dataset_index}。"""
+    picked = {}
+    for i, it in enumerate(items):
+        k = _edit_kind(it.get("prompt", ""))
+        if k in kinds and k not in picked:
+            picked[k] = i
+        if len(picked) == len(kinds):
+            break
+    return picked
+
+
+@torch.no_grad()
+def _decode_latent_to_mp4(model, latent, device, dtype, out_path):
+    """把一段干净 latent（源/目标）解码成 mp4，仅供 rank0 写参考视频。"""
+    pixel = model.vae.decode_to_pixel(latent.to(device, dtype))  # [B, F, C, H, W]
+    vid = pixel[0].float().clamp(-1, 1)
+    vid = ((vid + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8)
+    vid = vid.permute(0, 2, 3, 1).cpu()
+    write_video(out_path, vid, fps=16)
+
+
+@torch.no_grad()
+def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_scheduler,
+                device, dtype, out_path, is_main, sample_steps=-1):
+    """Few-step denoise of one fixed eval clip with the CD EMA student -> mp4.
+
+    The generator forward is an FSDP collective, so all ranks run the same sample
+    sequence; only rank0 decodes and writes the video.
+    """
+    cond, _ = build_cond(eval_batch)
+    f = image_or_video_shape[1]
+    shape = [1] + list(image_or_video_shape[1:])
+    latents = torch.randn(shape, device=device, dtype=dtype)
+    steps = int(getattr(model.config, "discrete_cd_N", 4)) if sample_steps <= 0 else int(sample_steps)
+    sample_scheduler.set_timesteps(num_inference_steps=steps, denoising_strength=1.0)
+    sample_scheduler.timesteps = sample_scheduler.timesteps.to(device)
+    for t in sample_scheduler.timesteps:
+        timestep = t * torch.ones([1, f], device=device, dtype=dtype)
+        flow, _ = model.generator_ema(noisy_image_or_video=latents,
+                                      conditional_dict=cond, timestep=timestep)
+        latents = sample_scheduler.step(flow, timestep, latents).to(dtype)
+    if not is_main:
+        return None
+    mse = None
+    if "target_latent" in eval_batch:
+        tgt = eval_batch["target_latent"].to(device, dtype)
+        if tgt.shape == latents.shape:
+            mse = torch.mean((latents.float() - tgt.float()) ** 2).item()
+    pixel = model.vae.decode_to_pixel(latents)         # [B, F, C, H, W] in [-1, 1]
+    vid = pixel[0].float().clamp(-1, 1)                # [F, C, H, W]
+    vid = ((vid + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8)
+    vid = vid.permute(0, 2, 3, 1).cpu()                # [F, H, W, C]
+    write_video(out_path, vid, fps=16)
+    return mse
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--logdir", required=True)
+    ap.add_argument("--resume", default="auto", help="'auto' or path to model.pt")
+    ap.add_argument("--max_iters", type=int, default=3000)
+    ap.add_argument("--save_every", type=int, default=500)
+    ap.add_argument("--log_every", type=int, default=10)
+    ap.add_argument("--grad_accum", type=int, default=-1,
+                    help="gradient accumulation steps (micro-batches per optimizer step); "
+                         "-1 = use config gradient_accumulation_steps or 1")
+    ap.add_argument("--sample_every", type=int, default=-1,
+                    help="decode a sample video every N steps; -1 ties it to --save_every, 0 disables")
+    ap.add_argument("--sample_steps", type=int, default=-1,
+                    help="inference steps for the progress sample; -1 = config discrete_cd_N")
+    args = ap.parse_args()
+
+    dist_info = D.init_distributed()
+    distributed = dist_info["distributed"]
+    device = dist_info["device"]
+    is_main = dist_info["is_main"]
+
+    run_dir = args.logdir
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    sample_dir = os.path.join(run_dir, "samples")
+    if is_main:
+        os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(sample_dir, exist_ok=True)
+    D.barrier()
+    log = Logger(os.path.join(run_dir, "train.log"), is_main=is_main)
+    metrics_path = os.path.join(run_dir, "metrics.jsonl")
+    sample_metrics_path = os.path.join(run_dir, "sample_metrics.jsonl")
+    writer = SummaryWriter(os.path.join(run_dir, "tensorboard")) if is_main else None
+    sample_every = args.save_every if args.sample_every == -1 else args.sample_every
+
+    cfg = OmegaConf.merge(
+        OmegaConf.load("configs/default_config.yaml"),
+        OmegaConf.load(args.config),
+    )
+    grad_accum = args.grad_accum if args.grad_accum and args.grad_accum > 0 \
+        else int(getattr(cfg, "gradient_accumulation_steps", 1) or 1)
+    grad_accum = max(1, grad_accum)
+    cfg.gradient_accumulation_steps = grad_accum
+    dtype = torch.bfloat16 if cfg.mixed_precision else torch.float32
+    torch.manual_seed(int(getattr(cfg, "seed", 0)) + dist_info["rank"])
+
+    if is_main:
+        script_meta_path = os.path.join(run_dir, "script_env.json")
+        script_meta = {}
+        if os.path.exists(script_meta_path):
+            with open(script_meta_path) as f:
+                script_meta = json.load(f)
+        runtime = {
+            "args": vars(args),
+            "command": " ".join(sys.argv),
+            "start_time": datetime.now().isoformat(),
+            "host": socket.gethostname(),
+            "world_size": dist_info["world_size"],
+            "distributed": distributed,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "dtype": str(dtype),
+            "grad_accum": grad_accum,
+            "sample_every": sample_every,
+            "sample_steps": args.sample_steps,
+            "script": script_meta,
+        }
+        effective_cfg = OmegaConf.to_container(cfg, resolve=True)
+        effective_cfg["_runtime"] = runtime
+        OmegaConf.save(cfg, os.path.join(run_dir, "config.yaml"))
+        OmegaConf.save(OmegaConf.create(effective_cfg),
+                       os.path.join(run_dir, "effective_config.yaml"))
+        with open(os.path.join(run_dir, "effective_config.json"), "w") as f:
+            json.dump(effective_cfg, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(run_dir, "run_meta.json"), "w") as f:
+            json.dump(runtime, f, ensure_ascii=False, indent=2)
+    log(f"[run] dir={run_dir} | config={args.config} | dtype={dtype} "
+        f"| world_size={dist_info['world_size']} | distributed={distributed}")
+
+    sharding = getattr(cfg, "sharding_strategy", "full")
+    ema_weight = float(getattr(cfg, "ema_weight", 0.95))
+    ema_start_step = int(getattr(cfg, "ema_start_step", 0))
+    model = EditNaiveConsistency(cfg, device=device)
+    sample_scheduler = FlowMatchScheduler(
+        shift=getattr(cfg, "timestep_shift", 5.0),
+        sigma_min=0.0,
+        extra_one_step=True,
+    )
+
+    # ---- resume: load weights into the RAW modules BEFORE FSDP shards them --
+    # (optimizer state is restored AFTER the optimizer is built, see below)
+    step, resume_optim_sd = 0, None
+    if args.resume:
+        path = find_latest(ckpt_dir)[0] if args.resume == "auto" else args.resume
+        if path and os.path.exists(path):
+            sd = torch.load(path, map_location="cpu")
+            if "generator" in sd:
+                model.generator.load_state_dict(sd["generator"], strict=False)
+            if "generator_ema" in sd:
+                model.generator_ema.load_state_dict(sd["generator_ema"], strict=False)
+            step = int(sd.get("step", 0))
+            resume_optim_sd = sd.get("optimizer")
+            log(f"[train] resumed from {path} at step {step}")
+
+    if distributed:
+        # generator is trainable -> fp32 master; the EMA twin must be wrapped
+        # identically (fp32) so per-rank shards align for the in-place EMA update.
+        model.generator = D.fsdp_wrap_single(
+            model.generator.float(), sharding, cfg.mixed_precision)
+        model.generator_ema = D.fsdp_wrap_single(
+            model.generator_ema.float(), sharding, cfg.mixed_precision)
+        model.teacher = D.fsdp_wrap_single(
+            model.teacher, sharding, cfg.mixed_precision)
+        if model.text_encoder is not None:
+            model.text_encoder = D.fsdp_wrap_single(
+                model.text_encoder, sharding, cfg.mixed_precision)
+        model.vae = model.vae.to(device).to(dtype)
+    else:
+        model.generator = model.generator.to(device).to(dtype)
+        model.generator_ema = model.generator_ema.to(device).to(dtype)
+        model.teacher = model.teacher.to(device).to(dtype)
+        if model.text_encoder is not None:
+            model.text_encoder = model.text_encoder.to(device)
+        model.vae = model.vae.to(device).to(dtype)
+
+    opt = torch.optim.AdamW(
+        [p for p in model.generator.parameters() if p.requires_grad],
+        lr=cfg.lr, betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay)
+    if D.load_optim_state_dict(model.generator, opt, resume_optim_sd, distributed):
+        log("[train] restored optimizer state from checkpoint")
+    elif step > 0:
+        log("[train] checkpoint has no optimizer state -> optimizer starts fresh")
+
+    dataset = EditLatentDataset(cfg.data_path, load_target=True)
+    loader = D.make_loader(dataset, cfg.batch_size, edit_collate, distributed)
+    data = cycle(loader)
+    log(f"[train] dataset size {len(dataset)} | grad_accum {grad_accum} | global batch "
+        f"{cfg.batch_size * dist_info['world_size'] * grad_accum} "
+        f"(per-gpu micro-batch {cfg.batch_size} x world {dist_info['world_size']} x accum {grad_accum})")
+
+    neg_prompt = cfg.negative_prompt
+    uncond_cache = None
+    # When the encoder is dropped (cache_text_embeds), get the negative embed once.
+    neg_embed = load_or_make_neg_embed(cfg, device, is_main) \
+        if model.text_encoder is None else None
+    if model.text_encoder is None:
+        log("[train] cache_text_embeds: umT5 encoder dropped; using batch "
+            "`prompt_embeds` + cached negative embed")
+
+    def build_cond(batch):
+        nonlocal uncond_cache
+        b = len(batch["prompts"])
+        # conditional prompt embeds: prefer precomputed (gen_text_embeds.py).
+        if "prompt_embeds" in batch:
+            cond = {"prompt_embeds": batch["prompt_embeds"].to(device, dtype)}
+        elif model.text_encoder is not None:
+            with torch.no_grad():
+                cond = dict(model.text_encoder(text_prompts=batch["prompts"]))
+        else:
+            raise RuntimeError(
+                "cache_text_embeds is on but this batch has no `prompt_embeds`; "
+                "run bernini_causvid/tools/gen_text_embeds.py to populate the index, "
+                "or set cache_text_embeds: false in the config.")
+        # unconditional (negative) embeds -- computed/loaded once, shape [1, L, D].
+        if uncond_cache is None:
+            if neg_embed is not None:
+                uncond_cache = {"prompt_embeds": neg_embed.to(device, dtype)}
+            else:
+                with torch.no_grad():
+                    u = model.text_encoder(text_prompts=[neg_prompt])
+                uncond_cache = {"prompt_embeds": u["prompt_embeds"][:1].detach()}
+        cond["source_latents"] = [batch["source_latent"].to(device, dtype)]
+        if "ref_latents" in batch:
+            cond["ref_latents"] = [r.to(device, dtype) for r in batch["ref_latents"]]
+        uncond = {"prompt_embeds": uncond_cache["prompt_embeds"].expand(b, -1, -1)}
+        uncond["source_latents"] = cond["source_latents"]
+        if "ref_latents" in cond:
+            uncond["ref_latents"] = cond["ref_latents"]
+        return cond, uncond
+
+    image_or_video_shape = list(cfg.image_or_video_shape)
+    # 固定的评测样本，使各步进度视频可纵向比较；每种编辑类型（增/删/改）各取一条。
+    kinds = [k for k, _ in EDIT_KINDS]
+    picked = select_eval_items(dataset.items, kinds)
+    eval_specs = []
+    for kind in kinds:
+        idx = picked.get(kind)
+        if idx is None:
+            log(f"[train] WARN: no '{kind}' sample found in dataset, skipping it")
+            continue
+        eval_specs.append((kind, idx, edit_collate([dataset[idx]])))
+    if not eval_specs:
+        eval_specs.append(("sample", 0, edit_collate([dataset[0]])))
+
+    if is_main:
+        meta = {"data_path": cfg.data_path, "samples": {}}
+        for kind, idx, eb in eval_specs:
+            meta["samples"][kind] = {"index": idx,
+                                     "prompt": dataset.items[idx].get("prompt", "")}
+            try:
+                _decode_latent_to_mp4(model, eb["source_latent"], device, dtype,
+                                      os.path.join(sample_dir, f"_source_{kind}.mp4"))
+                if "target_latent" in eb:
+                    _decode_latent_to_mp4(model, eb["target_latent"], device, dtype,
+                                          os.path.join(sample_dir, f"_target_{kind}.mp4"))
+            except Exception as e:
+                log(f"[train] WARN: failed to write ref video for '{kind}': {e}")
+        with open(os.path.join(sample_dir, "_eval_meta.json"), "w") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    D.barrier()
+
+    log("[train] eval samples: "
+        + ", ".join(f"{k}=#{i}" for k, i, _ in eval_specs))
+    log(f"[train] start at step {step}, max_iters {args.max_iters} | sample_every={sample_every}")
+    prev = None
+    while step < args.max_iters:
+        opt.zero_grad(set_to_none=True)
+        # 累积 grad_accum 个 micro-batch 的梯度后再做一次 optimizer.step。
+        # loss 除以 grad_accum，使累积梯度等于这些 micro-batch 的平均梯度。
+        accum_loss = 0.0
+        for _ in range(grad_accum):
+            batch = next(data)
+            if "target_latent" not in batch:
+                raise RuntimeError("Stage 2 CF++ requires `target` latents in the manifest/index.")
+            cond, uncond = build_cond(batch)
+            clean = batch["target_latent"].to(device, dtype)
+            loss, _ = model.generator_loss(cond, uncond, clean)
+            (loss / grad_accum).backward()
+            accum_loss += loss.item()
+        loss_micro = accum_loss / grad_accum  # 本 optimizer step 内 micro-batch 的平均损失
+        gnorm = D.clip_grad_norm_(model.generator, 10.0, distributed)
+        opt.step()
+        step += 1
+
+        if step >= ema_start_step:
+            D.ema_update_twin(model.generator_ema, model.generator, ema_weight, distributed)
+
+        if step % args.log_every == 0:
+            now = time.time(); dt = (now - prev) if prev else 0.0; prev = now
+            loss_v = D.reduce_mean(loss_micro, distributed)
+            log(f"[train] step {step}/{args.max_iters} | loss {loss_v:.4f} "
+                f"| grad_norm {float(gnorm):.3f} | {dt:.2f}s/{args.log_every}it")
+            if is_main:
+                append_jsonl(metrics_path, {"step": step, "loss": loss_v,
+                                            "grad_norm": float(gnorm), "lr": cfg.lr,
+                                            "sec_per_window": dt,
+                                            "time": datetime.now().isoformat()})
+                writer.add_scalar("train/loss", loss_v, step)
+                writer.add_scalar("train/grad_norm", float(gnorm), step)
+                writer.add_scalar("train/sec_per_window", dt, step)
+                writer.add_scalar("train/lr", cfg.lr, step)
+
+        if step % args.save_every == 0:
+            # state-dict gathers are collectives: all ranks must call together.
+            gen_sd = D.full_state_dict(model.generator, distributed)
+            ema_sd = D.full_state_dict(model.generator_ema, distributed)
+            optim_sd = D.optim_full_state_dict(model.generator, opt, distributed)
+            if is_main:
+                d = os.path.join(ckpt_dir, f"checkpoint_model_{step:06d}")
+                os.makedirs(d, exist_ok=True)
+                torch.save({"generator": gen_sd, "generator_ema": ema_sd,
+                            "optimizer": optim_sd, "step": step},
+                           os.path.join(d, "model.pt"))
+                log(f"[train] saved {d}/model.pt (+optim+ema)")
+            D.barrier()
+
+        if sample_every and step % sample_every == 0:
+            sample_mses = {}
+            for kind, _idx, eb in eval_specs:
+                try:
+                    out = os.path.join(sample_dir, f"step_{step:06d}_{kind}.mp4")
+                    mse = save_sample(model, eb, build_cond, image_or_video_shape,
+                                      sample_scheduler, device, dtype, out, is_main,
+                                      sample_steps=args.sample_steps)
+                    if is_main:
+                        if mse is not None:
+                            sample_mses[kind] = mse
+                        log(f"[train] wrote sample {out}"
+                            + (f" | mse {mse:.4f}" if mse is not None else ""))
+                except Exception as e:
+                    log(f"[train] sample '{kind}' failed at step {step}: {e}")
+            if is_main and sample_mses:
+                mean_mse = sum(sample_mses.values()) / len(sample_mses)
+                rec = {"step": step, "sample_mse_mean": mean_mse,
+                       "time": datetime.now().isoformat()}
+                for k, v in sample_mses.items():
+                    rec[f"sample_mse_{k}"] = v
+                    writer.add_scalar(f"sample/mse_{k}", v, step)
+                writer.add_scalar("sample/mse_mean", mean_mse, step)
+                append_jsonl(sample_metrics_path, rec)
+                log("[train] sample mse mean {:.4f} (".format(mean_mse)
+                    + ", ".join(f"{k}={v:.4f}" for k, v in sample_mses.items()) + ")")
+
+    log("[train] done")
+    if writer is not None:
+        writer.close()
+    log.close()
+
+
+if __name__ == "__main__":
+    main()

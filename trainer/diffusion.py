@@ -2,12 +2,14 @@ import gc
 import logging
 
 from model import CausalDiffusion
+from model.edit_models import EditCausalDiffusion
 from utils.dataset import cycle, LatentLMDBDataset
 from utils.misc import set_seed
 import torch.distributed as dist
 from omegaconf import OmegaConf
 import torch
 import wandb
+from torch.utils.tensorboard import SummaryWriter
 import time
 import os
 import math
@@ -54,10 +56,18 @@ class Trainer:
                 dir=config.wandb_save_dir
             )
 
+        self.writer = None
+        if self.is_main_process and config.logdir:
+            self.writer = SummaryWriter(os.path.join(config.logdir, "tensorboard"))
+
         self.output_path = config.logdir
 
         # Step 2: Initialize the model and optimizer
-        self.model = CausalDiffusion(config, device=self.device)
+        self.edit = getattr(config, "edit", False)
+        if self.edit:
+            self.model = EditCausalDiffusion(config, device=self.device)
+        else:
+            self.model = CausalDiffusion(config, device=self.device)
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=config.sharding_strategy,
@@ -85,8 +95,14 @@ class Trainer:
         )
 
         # Step 3: Initialize the dataloader
-        dataset = LatentLMDBDataset(config.data_path, max_pair=int(1e8))
-       
+        collate_fn = None
+        if self.edit:
+            from bernini_causvid.data.edit_dataset import EditLatentDataset, edit_collate
+            dataset = EditLatentDataset(config.data_path, load_target=True)
+            collate_fn = edit_collate
+        else:
+            dataset = LatentLMDBDataset(config.data_path, max_pair=int(1e8))
+
         self.dataset = dataset
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
@@ -94,7 +110,8 @@ class Trainer:
             dataset,
             batch_size=config.batch_size,
             sampler=sampler,
-            num_workers=8)
+            num_workers=8,
+            collate_fn=collate_fn)
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
@@ -196,7 +213,16 @@ class Trainer:
 
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
-        if not self.config.load_raw_video:  # precomputed latent
+        edit_cond = None
+        if self.edit:
+            # editing: denoise/teacher-force the EDITED target; source + refs are
+            # the conditioning streams threaded via conditional_dict.
+            clean_latent = batch["target_latent"].to(device=self.device, dtype=self.dtype)
+            edit_cond = {"source_latents": [batch["source_latent"].to(device=self.device, dtype=self.dtype)]}
+            if "ref_latents" in batch:
+                edit_cond["ref_latents"] = [r.to(device=self.device, dtype=self.dtype)
+                                            for r in batch["ref_latents"]]
+        elif not self.config.load_raw_video:  # precomputed latent
             clean_latent = batch["clean_latent"].to(
                 device=self.device, dtype=self.dtype)
         else:  # encode raw video to latent
@@ -216,6 +242,8 @@ class Trainer:
         with torch.no_grad():
             conditional_dict = self.model.text_encoder(
                 text_prompts=text_prompts) 
+            if edit_cond is not None:
+                conditional_dict.update(edit_cond)
             if not getattr(self, "unconditional_dict", None):
                 unconditional_dict = self.model.text_encoder(
                     text_prompts=[self.config.negative_prompt] * batch_size)
@@ -251,6 +279,9 @@ class Trainer:
         if self.is_main_process:
             if not self.disable_wandb:
                 wandb.log(wandb_loss_dict, step=self.step)
+            if self.writer is not None:
+                for k, v in wandb_loss_dict.items():
+                    self.writer.add_scalar(k, v, self.step)
 
         if self.step % self.config.gc_interval == 0:
             if dist.get_rank() == 0:
@@ -277,4 +308,6 @@ class Trainer:
                 else:
                     if not self.disable_wandb:
                         wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                    if self.writer is not None:
+                        self.writer.add_scalar("per iteration time", current_time - self.previous_time, self.step)
                     self.previous_time = current_time

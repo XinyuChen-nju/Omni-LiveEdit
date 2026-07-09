@@ -1,0 +1,67 @@
+# Stage 1 — AR teacher-forcing distillation of the causal EDIT student.
+# Fully reuses the Causal-Forcing diffusion trainer; the only difference is
+# `edit: true`, which (1) builds the EditCausalDiffusion model (Bernini edit
+# backbone), (2) loads the source/ref/target edit dataset, and (3) threads the
+# source video + refs as causal conditioning streams. Training/inference
+# mechanics are identical to Causal-Forcing.
+
+edit: true
+trainer: diffusion
+causal: true
+teacher_forcing: true            # AR teacher-forcing (Stage 1)
+
+# ---- backbone (converted Bernini-R weights) --------------------------------
+model_kwargs:
+  model_name: Bernini-R-1.3B
+  model_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Bernini-R-1.3B
+  timestep_shift: 5.0
+  local_attn_size: -1            # -1 = global; set to N frames for local window
+  sink_size: 0
+
+# ---- FSDP / sharding -------------------------------------------------------
+generator_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+sharding_strategy: hybrid_full
+
+# ---- diffusion / loss ------------------------------------------------------
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+warp_denoising_step: false
+num_frame_per_block: 1           # frame-wise (set 3 for chunk-wise)
+noise_augmentation_max_timestep: 0
+load_raw_video: false
+
+# latent geometry [B, F, C, H, W] — 480x832, 81 frames (source/target aligned).
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+# ---- optimization ----------------------------------------------------------
+mixed_precision: true
+gradient_checkpointing: true
+batch_size: 1
+lr: 1.0e-5
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.0
+ema_weight: 0.0
+ema_start_step: 0
+seed: 0
+log_iters: 1000
+gc_interval: 100
+
+# ---- data (edit index.json: source/target/ref latents) --------------------
+data_path: /apdcephfs_hzlf/share_1227201/xinyu/Dataset/ReCo/distill_for_bernini_v1-4000/edit_lat_full/index.json
+
+# ---- misc ------------------------------------------------------------------
+eval_interval: 0
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+wandb_host: https://api.wandb.ai
+wandb_key: ''
+wandb_entity: ''
+wandb_project: bernini_edit_causal

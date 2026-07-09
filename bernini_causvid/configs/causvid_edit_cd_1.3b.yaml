@@ -1,0 +1,56 @@
+# Stage 2（方案 B）：因果一致性蒸馏 = 面向编辑的 Causal Forcing++。
+# 仅用 GT（源 + 编辑后目标）latents，把 Stage 1 的 ar_diffusion 编辑模型蒸馏成
+# 4 步因果编辑模型。产出的 `generator_ema` = causal_cd，用于初始化 Stage 3 DMD
+#（在那里设为 generator_ckpt）。
+
+# ---- 模型 / 骨架 -----------------------------------------------------------
+model_name: Bernini-R-1.3B
+model_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Bernini-R-1.3B
+text_encoder_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+vae_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+causal: true                      # 因果（单向）注意力
+num_frame_per_block: 1            # 每个自回归块的帧数（逐帧）
+timestep_shift: 5.0               # flow-matching 时间步偏移
+
+# ---- 一致性蒸馏 ------------------------------------------------------------
+teacher_forcing: true             # teacher forcing：用 GT 上下文喂入，稳定训练
+discrete_cd_N: 48                 # 一致性蒸馏的离散时间步数 N（teacher 轨迹的细分粒度）
+guidance_scale: 3.0               # teacher 评分时的 CFG 引导强度
+num_train_timestep: 1000          # 扩散总时间步数
+
+# 用于初始化 generator / generator_ema / teacher 的 Stage 1 检查点。
+# 设为 null / None / 空字符串时，直接使用 model_path 加载的 Bernini 原始权重。
+# generator_ckpt: runs/bernini_edit_ar/checkpoints/checkpoint_model_005000/model.pt  # Stage 1 (AR) 产出 model.pt
+generator_ckpt: null
+
+# latent 视频几何 [B, F, C, H, W]，对应 480x832、81 帧（与源对齐）。
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+# ---- 优化 ------------------------------------------------------------------
+mixed_precision: true        # 混合精度（bf16）训练
+gradient_checkpointing: true # 梯度检查点：用计算换显存
+batch_size: 1                # 每卡 batch 大小
+gradient_accumulation_steps: 1 # 梯度累积步数：每个优化步累积多少 micro-batch（1=不累积；等效全局 batch ×该值，显存不变）
+lr: 2.0e-6                   # 学习率
+beta1: 0.0                   # Adam 一阶动量 β1
+beta2: 0.999                 # Adam 二阶动量 β2
+weight_decay: 0.0            # 权重衰减
+ema_weight: 0.95             # 学生权重 EMA 衰减系数（保存的 generator_ema = causal_cd）
+ema_start_step: 200          # 第几步开始累计 EMA（0=一开始就累计）
+seed: 0                      # 随机种子
+
+# ---- 分布式 / FSDP（仅在用 torchrun 启动时生效）---------------------------
+# full = FULL_SHARD（单机）；hybrid_full = HYBRID_SHARD（节点内分片、节点间复制）
+# —— 多机推荐用 hybrid_full。每个编辑模型被包成一个 FSDP 单元（骨架经 forward_edit
+# 调用），所以只有这个开关起作用。
+sharding_strategy: hybrid_full
+
+# ---- 数据 ------------------------------------------------------------------
+data_path: /apdcephfs_hzlf/share_1227201/xinyu/Dataset/ReCo/distill_for_bernini_v1-4000/edit_lat_full/index.json
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'

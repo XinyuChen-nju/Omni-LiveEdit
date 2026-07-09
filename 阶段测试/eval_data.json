@@ -1,0 +1,44 @@
+[
+  {
+    "prompt": "Add a blue furry character with large eyes, a slight smile, wearing a maroon collared shirt, and two thin vertical silver bars in front of its chest, in the center of the frame.",
+    "source": "/apdcephfs/private_derrenchen/Dataset/ReCo/distill_for_bernini_eval-80/add/src_videos/1778512e83aa5a96a8e90d7ad807211d7ef3d1f5adf52656f4ddb4d1a50495a4.mp4",
+    "refs": [],
+    "task_type": "v2v",
+    "kind": "add"
+  },
+  {
+    "prompt": "Add a large, colorful macaw parrot with bright blue spread wings, a yellow body, a green crown, and a black beak, standing on a wooden perch, facing forward.",
+    "source": "/apdcephfs/private_derrenchen/Dataset/ReCo/distill_for_bernini_eval-80/add/src_videos/9013a4ccbe6a6fe41c5ede03d0c2cbd6c835d58e82b57bb9d331411d518c5ddf.mp4",
+    "refs": [],
+    "task_type": "v2v",
+    "kind": "add"
+  },
+  {
+    "prompt": "Remove the abstract blue glowing shape with the Apple logo on the left.",
+    "source": "/apdcephfs/private_derrenchen/Dataset/ReCo/distill_for_bernini_eval-80/remove/src_videos/f584e58a60581daf6b9e9499b76af67d0c3b83f5e738c0edc3e0bbfc1d7df66d.mp4",
+    "refs": [],
+    "task_type": "v2v",
+    "kind": "remove"
+  },
+  {
+    "prompt": "Remove the woman in the center.",
+    "source": "/apdcephfs/private_derrenchen/Dataset/ReCo/distill_for_bernini_eval-80/remove/src_videos/ee6f87f38b13ad3ae96295b623f500a6ad814b55f693311c3ff952bf988e1494.mp4",
+    "refs": [],
+    "task_type": "v2v",
+    "kind": "remove"
+  },
+  {
+    "prompt": "Replace the globe on the table to the right with a young man wearing a blue sweater and white collar, writing on paper.",
+    "source": "/apdcephfs/private_derrenchen/Dataset/ReCo/distill_for_bernini_eval-80/replace/src_videos/1f8025006243524c1659a87116a0574a79a6fddd8d711f86ab3a0b62ead1fba5.mp4",
+    "refs": [],
+    "task_type": "v2v",
+    "kind": "replace"
+  },
+  {
+    "prompt": "Replace the clear crystal ball on a wooden stand on the dark table with an open book.",
+    "source": "/apdcephfs/private_derrenchen/Dataset/ReCo/distill_for_bernini_eval-80/replace/src_videos/aa9446038637224c385566b8cd31e8f48a164cbbaacc4a08ba8b99222b0400e2.mp4",
+    "refs": [],
+    "task_type": "v2v",
+    "kind": "replace"
+  }
+]

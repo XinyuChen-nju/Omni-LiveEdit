@@ -1,0 +1,1 @@
+帮我检查这个代码/apdcephfs/private_derrenchen/Causal-Forcing/bernini_causvid，参考之前的审阅记录：/apdcephfs/private_derrenchen/Causal-Forcing/bernini_causvid/代码审阅， 给我仔细审查，我要蒸馏bernini编辑模型到少步因果。要仔细看实现方式和原本的bernini是否一致，并且重点关在蒸馏中 生成任务变成编辑任务的差异
