@@ -501,36 +501,11 @@ class CausalEditWanModel(CausalWanModel):
         for entry in cond_latents:
             lat, sid = entry[0], entry[1]
             is_source = entry[2] if len(entry) > 2 else True
-            region_timestep = entry[3] if len(entry) > 3 else None
-
             emb = self.patch_embedding(lat)                       # [B, dim, f, h, w]
             f, h, w = emb.shape[2:]
             region_specs.append((f * h * w, f, h, w, sid))
             tokens.append(emb.flatten(2).transpose(1, 2))
-
-            if region_timestep is None:
-                # 兼容旧调用：condition 跟随当前 target timestep。
-                region_t = cond_t_per_sample.view(b, 1).expand(b, f)
-            elif torch.is_tensor(region_timestep):
-                region_t = region_timestep.to(device).float()
-                if region_t.dim() == 1:
-                    region_t = region_t.view(b, 1).expand(b, f)
-                elif region_t.shape[1] == 1 and f > 1:
-                    region_t = region_t.expand(b, f)
-                if tuple(region_t.shape) != (b, f):
-                    raise ValueError(
-                        f"condition timestep shape {tuple(region_t.shape)} "
-                        f"does not match condition region {(b, f)}"
-                    )
-            else:
-                region_t = torch.full(
-                    (b, f),
-                    float(region_timestep),
-                    device=device,
-                )
-
-            region_times.append(region_t)
-
+            region_times.append(cond_t_per_sample.view(b, 1).expand(b, f))
             if is_source:
                 src_len += f * h * w
         cond_len = sum(rs[0] for rs in region_specs)

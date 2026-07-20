@@ -5,10 +5,10 @@
 
 # ---- 模型 / 骨架 -----------------------------------------------------------
 model_name: Bernini-R-1.3B
-model_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Bernini-R-1.3B
-text_encoder_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
-tokenizer_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
-vae_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+model_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Bernini-R-1.3B-Wan
+text_encoder_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+vae_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
 causal: true                      # 因果（单向）注意力
 num_frame_per_block: 1            # 每个自回归块的帧数（逐帧）
 timestep_shift: 5.0               # flow-matching 时间步偏移
@@ -52,5 +52,5 @@ seed: 0                      # 随机种子
 sharding_strategy: hybrid_full
 
 # ---- 数据 ------------------------------------------------------------------
-data_path: /apdcephfs_hzlf/share_1227201/xinyu/Dataset/ReCo/distill_for_bernini_v1-4000/edit_lat_full/index.json
+data_path: /opt/dlami/nvme/chenxinyu/data/Reco/distill_for_bernini_merged-60000/edit_lat_full/index.json
 negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'

@@ -30,7 +30,6 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.io import write_video
 
 from bernini_causvid.models.edit_diffusion import EditDiffusion
-from bernini_causvid.pipeline.edit_causal_inference import EditCausalInferencePipeline
 from bernini_causvid.data.edit_dataset import EditLatentDataset, edit_collate
 from bernini_causvid.train_common import Logger, append_jsonl, find_latest
 from bernini_causvid import dist_common as D
@@ -38,21 +37,25 @@ from utils.dataset import cycle
 from utils.scheduler import FlowMatchScheduler
 
 
-# 编辑类型直接来自 index.json 的 edit_type 字段。
-# add/remove/replace 用区域 mask；style/convert 按 config.region_loss_by_type 关闭区域 mask。
-EDIT_KINDS = [("add", "增"), ("remove", "删"), ("replace", "改"), ("style", "风格化")]
+# 编辑类型（增/删/改/风格化）由 prompt 首词区分：add=增、remove=删、
+# replace=改、convert=风格化（"Convert the video into a X style"）。
+EDIT_KINDS = [("add", "增"), ("remove", "删"), ("replace", "改"), ("convert", "风格化")]
+
+
+def _edit_kind(prompt):
+    """从指令文本里取出编辑类型首词（去掉前导 '*'、空白等噪声）。"""
+    toks = str(prompt).strip().lstrip("*").strip().split()
+    return toks[0].lower() if toks else ""
 
 
 def select_eval_items(items, kinds):
-    """为每种 edit_type 挑前两条样本。"""
-    picked = {k: [] for k in kinds}
+    """为每种编辑类型挑第一条样本，返回 {kind: dataset_index}。"""
+    picked = {}
     for i, it in enumerate(items):
-        k = str(it.get("edit_type", "")).lower()
-        if k == "convert":
-            k = "style"
-        if k in picked and len(picked[k]) < 2:
-            picked[k].append(i)
-        if all(len(v) == 2 for v in picked.values()):
+        k = _edit_kind(it.get("prompt", ""))
+        if k in kinds and k not in picked:
+            picked[k] = i
+        if len(picked) == len(kinds):
             break
     return picked
 
@@ -69,8 +72,7 @@ def _decode_latent_to_mp4(model, latent, device, dtype, out_path):
 
 @torch.no_grad()
 def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_scheduler,
-                device, dtype, out_path, is_main, sample_steps=-1,
-                sample_seed=0):
+                device, dtype, out_path, is_main, sample_steps=-1):
     """Multi-step denoise of one fixed eval clip (NO teacher forcing) -> mp4.
 
     Shows whether the Stage-1 model actually edits the source under the instruction
@@ -88,53 +90,19 @@ def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_sche
     a downward trend across steps means the edit is matching GT better.
     """
     cond = build_cond(eval_batch)
+    f = image_or_video_shape[1]
+    shape = [1] + list(image_or_video_shape[1:])
+    latents = torch.randn(shape, device=device, dtype=dtype)
     steps = sample_scheduler.num_train_timesteps if sample_steps <= 0 else int(sample_steps)
-
-    sample_scheduler.set_timesteps(
-        num_inference_steps=steps,
-        denoising_strength=1.0,
-    )
-    step_list = []
-    for t in sample_scheduler.timesteps.round().long().tolist():
-        t = max(0, int(t))
-        if not step_list or t < step_list[-1]:
-            step_list.append(t)
-
-    sample_cfg = OmegaConf.create(
-        OmegaConf.to_container(model.config, resolve=True)
-    )
-    sample_cfg.denoising_step_list = step_list
-    sample_cfg.warp_denoising_step = False
-    sample_cfg.context_noise = float(getattr(model.config, "context_noise", 0.0))
-    sample_cfg.source_noise = float(getattr(model.config, "source_noise", 0.0))
-
-    pipeline = EditCausalInferencePipeline(
-        sample_cfg,
-        device=device,
-        generator=model.generator,
-        text_encoder=None,
-        vae=None,
-    )
-
-    source = cond["source_latents"][0]
-
-    # 每个评测样本使用固定初始噪声。
-    # 显式创建同 seed 的 Generator，避免不同训练 step 和不同 rank
-    # 因全局随机状态不同而产生不同初始噪声。
-    noise_generator = torch.Generator(device=source.device)
-    noise_generator.manual_seed(int(sample_seed))
-    noise = torch.randn(
-        source.shape,
-        device=source.device,
-        dtype=source.dtype,
-        generator=noise_generator,
-    )
-
-    latents = pipeline.inference(
-        noise=noise,
-        conditional_dict=cond,
-        return_latents=True,
-    )
+    sample_scheduler.set_timesteps(num_inference_steps=steps, denoising_strength=1.0)
+    sample_scheduler.timesteps = sample_scheduler.timesteps.to(device)
+    for t in sample_scheduler.timesteps:
+        timestep = t * torch.ones([1, f], device=device, dtype=dtype)
+        flow, _ = model.generator(noisy_image_or_video=latents,
+                                  conditional_dict=cond, timestep=timestep)
+        # scheduler.step 内部以 fp32 计算并返回 float32，会让下一步的 latents 与
+        # bf16 模型权重不匹配（Input float vs bias bf16），故转回模型 dtype。
+        latents = sample_scheduler.step(flow, timestep, latents).to(dtype)
     if not is_main:
         return None
     # 客观指标：采样结果与 GT target 的 latent 空间 MSE（重建/编辑一致性）。
@@ -313,14 +281,16 @@ def main():
 
     image_or_video_shape = list(cfg.image_or_video_shape)
     # 固定的评测样本，使各步进度视频可纵向比较；每种编辑类型（增/删/改/风格化）各取一条，
-    # 这样每次采样都能同时检查 add/remove/replace/style 四类的效果。
+    # 这样每次采样都能同时检查 add/remove/replace/convert 四类的效果。
     kinds = [k for k, _ in EDIT_KINDS]
     picked = select_eval_items(dataset.items, kinds)
     eval_specs = []  # list of (kind, eval_batch)
     for kind in kinds:
-        for n, idx in enumerate(picked.get(kind, []), 1):
-            name = f"{kind}_{n}"
-            eval_specs.append((name, idx, edit_collate([dataset[idx]])))
+        idx = picked.get(kind)
+        if idx is None:
+            log(f"[train] WARN: no '{kind}' sample found in dataset, skipping it")
+            continue
+        eval_specs.append((kind, idx, edit_collate([dataset[idx]])))
     if not eval_specs:  # 兜底：数据集没有可识别的编辑类型时，退回首条样本。
         eval_specs.append(("sample", 0, edit_collate([dataset[0]])))
 
@@ -328,11 +298,8 @@ def main():
     if is_main:
         meta = {"data_path": cfg.data_path, "samples": {}}
         for kind, idx, eb in eval_specs:
-            meta["samples"][kind] = {
-                "index": idx,
-                "edit_type": dataset.items[idx].get("edit_type", ""),
-                "prompt": dataset.items[idx].get("prompt", ""),
-            }
+            meta["samples"][kind] = {"index": idx,
+                                     "prompt": dataset.items[idx].get("prompt", "")}
             try:
                 _decode_latent_to_mp4(model, eb["source_latent"], device, dtype,
                                       os.path.join(sample_dir, f"_source_{kind}.mp4"))
@@ -357,18 +324,34 @@ def main():
         accum_edit_frac = 0.0   # editing-region fraction of the frame (diagnostic)
         edit_micro = 0          # micro-batches that reported the edit diagnostics
         for _ in range(grad_accum):
+            print(f"[rank {rank}] step {step} before next(data)", flush=True)
             batch = next(data)
+            print(f"[rank {rank}] step {step} after next(data) edit_types={batch.get('edit_types')}", flush=True)
+
             if "target_latent" not in batch:
                 raise RuntimeError(
                     "Stage 1 requires `target` latents in the manifest/index "
                     "(run gen_edit_targets.py with `target` set, load_target=True).")
+
+            print(f"[rank {rank}] step {step} before build_cond", flush=True)
             cond = build_cond(batch)
+            print(f"[rank {rank}] step {step} after build_cond", flush=True)
+
+            print(f"[rank {rank}] step {step} before target to cuda", flush=True)
             clean = batch["target_latent"].to(device, dtype)
+            print(f"[rank {rank}] step {step} after target to cuda", flush=True)
+
             # 每个样本的编辑类型来自数据 index.json 的显式 `edit_type` 字段（不解析 prompt），
             # 供 loss 按 config.region_loss_by_type 决定该类型是否启用区域加权。
+            print(f"[rank {rank}] step {step} before generator_loss", flush=True)
             loss, ld = model.generator_loss(image_or_video_shape, cond, clean,
                                             edit_types=batch.get("edit_types"))
+            print(f"[rank {rank}] step {step} after generator_loss", flush=True)
+
+            print(f"[rank {rank}] step {step} before backward", flush=True)
             (loss / grad_accum).backward()
+            print(f"[rank {rank}] step {step} after backward", flush=True)
+
             accum_loss += loss.item()
             if "edit_region_loss" in ld:
                 accum_edit += float(ld["edit_region_loss"])
@@ -390,24 +373,12 @@ def main():
         if step % args.log_every == 0:
             now = time.time(); dt = (now - prev) if prev else 0.0; prev = now
             loss_v = D.reduce_mean(loss_micro, distributed)
-
-            # These reductions must be called unconditionally by every rank.
-            # Some local batches (for example, all-style batches) produce no
-            # edit-region diagnostics. Conditional collectives would therefore
-            # desynchronise ranks before checkpoint state-dict gathering.
-            edit_sum_v = D.reduce_mean(float(accum_edit), distributed)
-            edit_frac_sum_v = D.reduce_mean(float(accum_edit_frac), distributed)
-            edit_count_v = D.reduce_mean(float(edit_micro), distributed)
-
             msg = (f"[train] step {step}/{args.max_iters} | loss {loss_v:.4f} "
                    f"| grad_norm {float(gnorm):.3f} | {dt:.2f}s/{args.log_every}it")
             extra = {}
-
-            # The ratio of rank-mean sums to the rank-mean counts is equal to
-            # the globally weighted mean over all valid micro-batches.
-            if edit_count_v > 0.0:
-                edit_v = edit_sum_v / edit_count_v
-                frac_v = edit_frac_sum_v / edit_count_v
+            if edit_loss_micro is not None:
+                edit_v = D.reduce_mean(edit_loss_micro, distributed)
+                frac_v = D.reduce_mean(edit_frac_micro, distributed)
                 msg += f" | edit_loss {edit_v:.4f} | edit_frac {frac_v:.3f}"
                 extra = {"edit_region_loss": edit_v, "edit_frac": frac_v}
             log(msg)
@@ -448,12 +419,9 @@ def main():
             for kind, _idx, eb in eval_specs:
                 try:
                     out = os.path.join(sample_dir, f"step_{step:06d}_{kind}.mp4")
-                    mse = save_sample(
-                        model, eb, build_cond, image_or_video_shape,
-                        sample_scheduler, device, dtype, out, is_main,
-                        sample_steps=args.sample_steps,
-                        sample_seed=int(getattr(cfg, "seed", 0)) + int(_idx),
-                    )
+                    mse = save_sample(model, eb, build_cond, image_or_video_shape,
+                                      sample_scheduler, device, dtype, out, is_main,
+                                      sample_steps=args.sample_steps)
                     if is_main:
                         if mse is not None:
                             sample_mses[kind] = mse

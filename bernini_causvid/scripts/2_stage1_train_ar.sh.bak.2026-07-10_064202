@@ -8,8 +8,8 @@
 #   多机：             用 bernini_causvid/multinode/launch.sh 一键拉起（推荐）
 set -e
 set -o pipefail
-CF_ROOT="${CF_ROOT:-/opt/dlami/nvme/chenxinyu/project/Causal-Forcing}"
-PY="${PY:-/opt/dlami/nvme/miniconda3/envs/causal-forcing/bin/python}"
+CF_ROOT="/apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing"
+PY="/apdcephfs_hzlf/share_1227201/xinyu/conda_setup/miniconda3/envs/causal_forcing/bin/python"
 cd "$CF_ROOT"
 
 # 训练超参：均可用同名环境变量覆盖（多机时由 launch.sh 统一下发）。

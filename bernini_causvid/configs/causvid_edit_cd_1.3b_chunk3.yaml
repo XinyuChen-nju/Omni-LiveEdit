@@ -8,10 +8,10 @@
 
 # ---- 模型 / 骨架 -----------------------------------------------------------
 model_name: Bernini-R-1.3B
-model_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Bernini-R-1.3B
-text_encoder_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
-tokenizer_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
-vae_path: /apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+model_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Bernini-R-1.3B-Wan
+text_encoder_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+vae_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
 causal: true                      # 因果（单向）注意力
 num_frame_per_block: 3            # 每个自回归块 3 帧（与 Stage-1 AR chunk3 + 原始 chunkwise CD 对齐）
 timestep_shift: 5.0               # flow-matching 时间步偏移
@@ -24,7 +24,7 @@ guidance_scale: 3.0               # teacher 评分时的 CFG 引导强度
 num_train_timestep: 1000          # 扩散总时间步数
 
 # 用于初始化 generator / generator_ema / teacher 的 Stage 1（AR）最新权重。
-generator_ckpt: runs/bernini_edit_ar/20260702_133519/checkpoints/checkpoint_model_002300/model.pt
+generator_ckpt: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/runs/bernini_edit_ar/20260712_063250/checkpoints/checkpoint_model_009200/model.pt
 
 # latent 视频几何 [B, F, C, H, W]，对应 480x832、81 帧（与源对齐）。
 image_or_video_shape:
@@ -37,14 +37,14 @@ image_or_video_shape:
 # ---- 优化 ------------------------------------------------------------------
 mixed_precision: true        # 混合精度（bf16）训练
 gradient_checkpointing: true # 梯度检查点：用计算换显存
-batch_size: 1                # 每卡 batch 大小
-gradient_accumulation_steps: 1 # 梯度累积步数：每个优化步累积多少 micro-batch（1=不累积；等效全局 batch ×该值，显存不变）
+batch_size: 2
+gradient_accumulation_steps: 2
 lr: 2.0e-6                   # 学习率
 beta1: 0.0                   # Adam 一阶动量 β1
 beta2: 0.999                 # Adam 二阶动量 β2
 weight_decay: 0.0            # 权重衰减
-ema_weight: 0.95             # 学生权重 EMA 衰减系数（保存的 generator_ema = causal_cd）
-ema_start_step: 200          # 第几步开始累计 EMA（0=一开始就累计）
+ema_weight: 0.99             # 学生权重 EMA 衰减系数（保存的 generator_ema = causal_cd）
+ema_start_step: 0            # EMA 从第 0 步开始更新；由此配置控制
 seed: 0                      # 随机种子
 
 # ---- 分布式 / FSDP（仅在用 torchrun 启动时生效）---------------------------
@@ -54,5 +54,5 @@ seed: 0                      # 随机种子
 sharding_strategy: hybrid_full
 
 # ---- 数据 ------------------------------------------------------------------
-data_path: /apdcephfs_hzlf/share_1227201/xinyu/Dataset/ReCo/distill_for_bernini_v1-4000/edit_lat_full/index.json
+data_path: /opt/dlami/nvme/chenxinyu/data/Reco/distill_for_bernini_merged-60000/edit_lat_full/index.json
 negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'

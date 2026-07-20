@@ -81,25 +81,14 @@ class EditDiffusionWrapper(nn.Module):
 
         prompt_embeds = conditional_dict["prompt_embeds"]
         source_latents = self._cond_list(conditional_dict, "source_latents")
-        source_timesteps = self._cond_list(
-            conditional_dict, "source_timesteps")
         ref_latents = self._cond_list(conditional_dict, "ref_latents")
 
         cond_latents = []
         sid = 1
-        for i, v in enumerate(source_latents):
-            # 第 4 项是该 source 的模型时间调制 timestep。
-            # 未提供时保留旧行为，由 forward_edit 回退到 target timestep。
-            src_t = source_timesteps[i] if i < len(source_timesteps) else None
-            cond_latents.append(
-                (v.permute(0, 2, 1, 3, 4), sid, True, src_t)
-            )
-            sid += 1
+        for v in source_latents:
+            cond_latents.append((v.permute(0, 2, 1, 3, 4), sid, True)); sid += 1
         for r in ref_latents:
-            cond_latents.append(
-                (r.permute(0, 2, 1, 3, 4), sid, False, None)
-            )
-            sid += 1
+            cond_latents.append((r.permute(0, 2, 1, 3, 4), sid, False)); sid += 1
 
         flow_pred = self.model.forward_edit(
             x=noisy_image_or_video.permute(0, 2, 1, 3, 4),

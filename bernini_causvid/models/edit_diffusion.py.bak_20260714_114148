@@ -95,9 +95,6 @@ class EditDiffusion(nn.Module):
         self.region_loss_by_type = (
             {str(k).lower(): bool(v) for k, v in dict(_rlbt).items()} if _rlbt else {}
         )
-        # 可选：对（硬）编辑区 mask 做 latent 空间闭运算（先膨胀后腐蚀），填补内部空洞、平滑边界。
-        # 默认 0 -> 不做，mask 与原来完全一致。仅作用于硬 mask（region_mask_soft=false）。
-        self.region_mask_close_kernel = int(getattr(config, "region_mask_close_kernel", 0) or 0)
 
     # per-block timestep indices (same block shares a noise level), like base._get_timestep.
     def _sample_timestep_index(self, b, f, lo, hi):
@@ -131,16 +128,7 @@ class EditDiffusion(nn.Module):
         m = diff / denom
         if self.region_mask_soft:
             return m
-        mask = (m > self.region_mask_threshold).to(m.dtype)
-        # 可选闭运算（先膨胀后腐蚀）：填补编辑区内部空洞、平滑边界。默认关（kernel <= 1）。
-        k = self.region_mask_close_kernel
-        if k > 1:
-            b, f = mask.shape[:2]
-            x = mask.flatten(0, 1)                                       # [B*F, 1, H, W]
-            x = F.max_pool2d(x, kernel_size=k, stride=1, padding=k // 2)   # 膨胀
-            x = -F.max_pool2d(-x, kernel_size=k, stride=1, padding=k // 2)  # 腐蚀
-            mask = x.unflatten(0, (b, f))
-        return mask
+        return (m > self.region_mask_threshold).to(m.dtype)
 
     def generator_loss(
         self,
@@ -191,42 +179,17 @@ class EditDiffusion(nn.Module):
         # edit so the model relies less on copying the exact source pixels. Refs and
         # the target/loss are untouched. We shallow-copy conditional_dict so the
         # caller's clean source is not mutated.
-        if conditional_dict.get("source_latents"):
-            source_inputs = []
-            source_timesteps = []
-
+        if self.source_noise_max_t > 0 and conditional_dict.get("source_latents"):
+            noised_src = []
             for s in conditional_dict["source_latents"]:
                 s = s.to(self.device, self.dtype)
                 sb, sf = s.shape[:2]
-
-                if self.source_noise_max_t > 0:
-                    # 同一个 t_src 同时用于：
-                    # 1. 给 source latent 加噪；
-                    # 2. source token 的时间调制。
-                    t_src = self._sample_timestep_value(
-                        sb, sf, self.source_noise_max_t)
-                    s_input = self.scheduler.add_noise(
-                        s.flatten(0, 1),
-                        torch.randn_like(s).flatten(0, 1),
-                        t_src.flatten(0, 1),
-                    ).unflatten(0, (sb, sf))
-                else:
-                    # source 不加噪时，对应 clean timestep=0。
-                    t_src = torch.zeros(
-                        (sb, sf),
-                        device=self.device,
-                        dtype=self.dtype,
-                    )
-                    s_input = s
-
-                source_inputs.append(s_input)
-                source_timesteps.append(t_src)
-
-            conditional_dict = {
-                **conditional_dict,
-                "source_latents": source_inputs,
-                "source_timesteps": source_timesteps,
-            }
+                t_src = self._sample_timestep_value(sb, sf, self.source_noise_max_t)
+                s_noisy = self.scheduler.add_noise(
+                    s.flatten(0, 1), torch.randn_like(s).flatten(0, 1), t_src.flatten(0, 1)
+                ).unflatten(0, (sb, sf))
+                noised_src.append(s_noisy)
+            conditional_dict = {**conditional_dict, "source_latents": noised_src}
 
         flow_pred, x0_pred = self.generator(
             noisy_image_or_video=noisy,

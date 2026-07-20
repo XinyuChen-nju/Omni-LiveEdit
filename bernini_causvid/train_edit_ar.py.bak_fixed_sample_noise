@@ -69,8 +69,7 @@ def _decode_latent_to_mp4(model, latent, device, dtype, out_path):
 
 @torch.no_grad()
 def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_scheduler,
-                device, dtype, out_path, is_main, sample_steps=-1,
-                sample_seed=0):
+                device, dtype, out_path, is_main, sample_steps=-1):
     """Multi-step denoise of one fixed eval clip (NO teacher forcing) -> mp4.
 
     Shows whether the Stage-1 model actually edits the source under the instruction
@@ -117,19 +116,7 @@ def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_sche
     )
 
     source = cond["source_latents"][0]
-
-    # 每个评测样本使用固定初始噪声。
-    # 显式创建同 seed 的 Generator，避免不同训练 step 和不同 rank
-    # 因全局随机状态不同而产生不同初始噪声。
-    noise_generator = torch.Generator(device=source.device)
-    noise_generator.manual_seed(int(sample_seed))
-    noise = torch.randn(
-        source.shape,
-        device=source.device,
-        dtype=source.dtype,
-        generator=noise_generator,
-    )
-
+    noise = torch.randn_like(source)
     latents = pipeline.inference(
         noise=noise,
         conditional_dict=cond,
@@ -448,12 +435,9 @@ def main():
             for kind, _idx, eb in eval_specs:
                 try:
                     out = os.path.join(sample_dir, f"step_{step:06d}_{kind}.mp4")
-                    mse = save_sample(
-                        model, eb, build_cond, image_or_video_shape,
-                        sample_scheduler, device, dtype, out, is_main,
-                        sample_steps=args.sample_steps,
-                        sample_seed=int(getattr(cfg, "seed", 0)) + int(_idx),
-                    )
+                    mse = save_sample(model, eb, build_cond, image_or_video_shape,
+                                      sample_scheduler, device, dtype, out, is_main,
+                                      sample_steps=args.sample_steps)
                     if is_main:
                         if mse is not None:
                             sample_mses[kind] = mse

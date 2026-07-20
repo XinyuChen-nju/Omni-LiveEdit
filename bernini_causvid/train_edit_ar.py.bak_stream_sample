@@ -30,7 +30,6 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.io import write_video
 
 from bernini_causvid.models.edit_diffusion import EditDiffusion
-from bernini_causvid.pipeline.edit_causal_inference import EditCausalInferencePipeline
 from bernini_causvid.data.edit_dataset import EditLatentDataset, edit_collate
 from bernini_causvid.train_common import Logger, append_jsonl, find_latest
 from bernini_causvid import dist_common as D
@@ -69,8 +68,7 @@ def _decode_latent_to_mp4(model, latent, device, dtype, out_path):
 
 @torch.no_grad()
 def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_scheduler,
-                device, dtype, out_path, is_main, sample_steps=-1,
-                sample_seed=0):
+                device, dtype, out_path, is_main, sample_steps=-1):
     """Multi-step denoise of one fixed eval clip (NO teacher forcing) -> mp4.
 
     Shows whether the Stage-1 model actually edits the source under the instruction
@@ -88,53 +86,19 @@ def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_sche
     a downward trend across steps means the edit is matching GT better.
     """
     cond = build_cond(eval_batch)
+    f = image_or_video_shape[1]
+    shape = [1] + list(image_or_video_shape[1:])
+    latents = torch.randn(shape, device=device, dtype=dtype)
     steps = sample_scheduler.num_train_timesteps if sample_steps <= 0 else int(sample_steps)
-
-    sample_scheduler.set_timesteps(
-        num_inference_steps=steps,
-        denoising_strength=1.0,
-    )
-    step_list = []
-    for t in sample_scheduler.timesteps.round().long().tolist():
-        t = max(0, int(t))
-        if not step_list or t < step_list[-1]:
-            step_list.append(t)
-
-    sample_cfg = OmegaConf.create(
-        OmegaConf.to_container(model.config, resolve=True)
-    )
-    sample_cfg.denoising_step_list = step_list
-    sample_cfg.warp_denoising_step = False
-    sample_cfg.context_noise = float(getattr(model.config, "context_noise", 0.0))
-    sample_cfg.source_noise = float(getattr(model.config, "source_noise", 0.0))
-
-    pipeline = EditCausalInferencePipeline(
-        sample_cfg,
-        device=device,
-        generator=model.generator,
-        text_encoder=None,
-        vae=None,
-    )
-
-    source = cond["source_latents"][0]
-
-    # 每个评测样本使用固定初始噪声。
-    # 显式创建同 seed 的 Generator，避免不同训练 step 和不同 rank
-    # 因全局随机状态不同而产生不同初始噪声。
-    noise_generator = torch.Generator(device=source.device)
-    noise_generator.manual_seed(int(sample_seed))
-    noise = torch.randn(
-        source.shape,
-        device=source.device,
-        dtype=source.dtype,
-        generator=noise_generator,
-    )
-
-    latents = pipeline.inference(
-        noise=noise,
-        conditional_dict=cond,
-        return_latents=True,
-    )
+    sample_scheduler.set_timesteps(num_inference_steps=steps, denoising_strength=1.0)
+    sample_scheduler.timesteps = sample_scheduler.timesteps.to(device)
+    for t in sample_scheduler.timesteps:
+        timestep = t * torch.ones([1, f], device=device, dtype=dtype)
+        flow, _ = model.generator(noisy_image_or_video=latents,
+                                  conditional_dict=cond, timestep=timestep)
+        # scheduler.step 内部以 fp32 计算并返回 float32，会让下一步的 latents 与
+        # bf16 模型权重不匹配（Input float vs bias bf16），故转回模型 dtype。
+        latents = sample_scheduler.step(flow, timestep, latents).to(dtype)
     if not is_main:
         return None
     # 客观指标：采样结果与 GT target 的 latent 空间 MSE（重建/编辑一致性）。
@@ -448,12 +412,9 @@ def main():
             for kind, _idx, eb in eval_specs:
                 try:
                     out = os.path.join(sample_dir, f"step_{step:06d}_{kind}.mp4")
-                    mse = save_sample(
-                        model, eb, build_cond, image_or_video_shape,
-                        sample_scheduler, device, dtype, out, is_main,
-                        sample_steps=args.sample_steps,
-                        sample_seed=int(getattr(cfg, "seed", 0)) + int(_idx),
-                    )
+                    mse = save_sample(model, eb, build_cond, image_or_video_shape,
+                                      sample_scheduler, device, dtype, out, is_main,
+                                      sample_steps=args.sample_steps)
                     if is_main:
                         if mse is not None:
                             sample_mses[kind] = mse

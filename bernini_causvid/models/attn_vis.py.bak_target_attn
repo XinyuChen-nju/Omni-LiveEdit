@@ -81,9 +81,6 @@ class AttnVisRecorder:
         #   per_target_frame == False : [num_src_frames, src_h, src_w]
         #   per_target_frame == True  : [nfpb, num_src_frames, src_h, src_w]
         self.src_maps = {}
-        # block index -> target-to-target attention map.
-        # Shape follows src_maps, but the key-frame dimension is visible target frames.
-        self.tgt_maps = {}
         # block index -> mean fraction of attention mass spent on refs / source / target
         self.mass = {}
 
@@ -118,8 +115,7 @@ class AttnVisRecorder:
         kv = k.shape[1]
         src_lo, src_hi = self.ref_tokens, int(ek_len)
         src_len = src_hi - src_lo
-        tgt_len = kv - src_hi
-        if src_len <= 0 or tgt_len <= 0:
+        if src_len <= 0:
             return
         scale = 1.0 / math.sqrt(d)
 
@@ -131,10 +127,8 @@ class AttnVisRecorder:
             # split queries into the nfpb target frames of this block.
             qf_per = s // self.nfpb if self.nfpb > 0 else s
             acc = torch.zeros(self.nfpb, src_len, device=q.device)
-            tgt_acc = torch.zeros(self.nfpb, tgt_len, device=q.device)
         else:
             acc = torch.zeros(src_len, device=q.device)
-            tgt_acc = torch.zeros(tgt_len, device=q.device)
         ref_mass = src_mass = tgt_mass = 0.0
         nq = 0
 
@@ -143,7 +137,6 @@ class AttnVisRecorder:
             scores = torch.matmul(qc, kf.transpose(-1, -2)) * scale  # [B,N,C,KV]
             probs = torch.softmax(scores, dim=-1)
             src_p = probs[..., src_lo:src_hi]                   # [B, N, C, src_len]
-            tgt_p = probs[..., src_hi:]                            # [B, N, C, tgt_len]
 
             ref_mass += probs[..., :src_lo].sum().item()
             src_mass += src_p.sum().item()
@@ -158,52 +151,24 @@ class AttnVisRecorder:
                     if sel[2].start >= sel[2].stop:
                         continue
                     acc[fi] += src_p[sel].sum(dim=(0, 1, 2))
-                    tgt_acc[fi] += tgt_p[sel].sum(dim=(0, 1, 2))
             else:
                 acc += src_p.sum(dim=(0, 1, 2))
-                tgt_acc += tgt_p.sum(dim=(0, 1, 2))
 
         # normalise to a mean probability mass per (query, head).
         if self.per_target_frame:
-            denom_q = max(nq // self.nfpb, 1)
-            acc = acc / denom_q
-            tgt_acc = tgt_acc / denom_q
-
+            acc = acc / max(nq // self.nfpb, 1)
             num_src_frames = src_len // self.frame_seq
-            num_tgt_frames = tgt_len // self.frame_seq
-
-            spatial = acc.reshape(
-                self.nfpb, num_src_frames, self.src_h, self.src_w
-            )
-            tgt_spatial = tgt_acc.reshape(
-                self.nfpb, num_tgt_frames, self.src_h, self.src_w
-            )
+            spatial = acc.reshape(self.nfpb, num_src_frames, self.src_h, self.src_w)
         else:
             acc = acc / max(nq, 1)
-            tgt_acc = tgt_acc / max(nq, 1)
-
             num_src_frames = src_len // self.frame_seq
-            num_tgt_frames = tgt_len // self.frame_seq
-
-            spatial = acc.reshape(
-                num_src_frames, self.src_h, self.src_w
-            )
-            tgt_spatial = tgt_acc.reshape(
-                num_tgt_frames, self.src_h, self.src_w
-            )
-
+            spatial = acc.reshape(num_src_frames, self.src_h, self.src_w)
         spatial = spatial.to(self.acc_device)
-        tgt_spatial = tgt_spatial.to(self.acc_device)
 
         if self._block not in self.src_maps:
             self.src_maps[self._block] = [torch.zeros_like(spatial), 0]
         self.src_maps[self._block][0] += spatial
         self.src_maps[self._block][1] += 1
-
-        if self._block not in self.tgt_maps:
-            self.tgt_maps[self._block] = [torch.zeros_like(tgt_spatial), 0]
-        self.tgt_maps[self._block][0] += tgt_spatial
-        self.tgt_maps[self._block][1] += 1
 
         denom = max(nq, 1)
         m = self.mass.setdefault(self._block, [0.0, 0.0, 0.0, 0])
@@ -214,13 +179,8 @@ class AttnVisRecorder:
 
     # ------------------------------------------------------------------ output
     def get_block_map(self, block):
-        """Mean target-to-source map for one block."""
+        """Mean attention map for a block (averaged over recorded layers/steps)."""
         s, c = self.src_maps[block]
-        return (s / max(c, 1)).float().numpy()
-
-    def get_target_block_map(self, block):
-        """Mean target-to-target map for one block."""
-        s, c = self.tgt_maps[block]
         return (s / max(c, 1)).float().numpy()
 
     def save(self, out_dir, src_pixels=None, cmap="jet", alpha=0.5,
@@ -230,18 +190,9 @@ class AttnVisRecorder:
         src_pixels: optional source video [1, 3, T, H, W] in [-1, 1] for overlay.
         """
         os.makedirs(out_dir, exist_ok=True)
-        raw_maps = {
-            f"block_{b}": self.get_block_map(b)
-            for b in sorted(self.src_maps)
-        }
-        raw_maps.update({
-            f"target_block_{b}": self.get_target_block_map(b)
-            for b in sorted(self.tgt_maps)
-        })
         np.savez_compressed(
             os.path.join(out_dir, "attn_maps.npz"),
-            **raw_maps
-        )
+            **{f"block_{b}": self.get_block_map(b) for b in sorted(self.src_maps)})
 
         try:
             import matplotlib
@@ -302,50 +253,6 @@ class AttnVisRecorder:
             fpath = os.path.join(out_dir, f"block_{b:02d}_src_attn.png")
             fig.savefig(fpath, dpi=120)
             plt.close(fig)
-
-        # target-to-target temporal attention
-        for b in sorted(self.tgt_maps):
-            tmap = self.get_target_block_map(b)
-
-            if tmap.ndim == 4:
-                query_maps = tmap
-            else:
-                query_maps = tmap[None]
-
-            for qi, qmap in enumerate(query_maps):
-                ntgt = qmap.shape[0]
-                vmax = float(qmap.max()) or 1e-8
-
-                cols = min(ntgt, 7)
-                rows = int(math.ceil(ntgt / cols))
-                fig, axes = plt.subplots(
-                    rows, cols,
-                    figsize=(cols * 2.2, rows * 2.2),
-                    squeeze=False
-                )
-
-                for j in range(rows * cols):
-                    ax = axes[j // cols][j % cols]
-                    ax.axis("off")
-                    if j >= ntgt:
-                        continue
-
-                    ax.imshow(qmap[j] / vmax, cmap=cmap)
-                    ax.set_title(f"key tgt f{j}", fontsize=7)
-
-                query_frame = b * self.nfpb + qi
-                fig.suptitle(
-                    f"query target f{query_frame} -> target frames",
-                    fontsize=10
-                )
-                fig.tight_layout()
-
-                fpath = os.path.join(
-                    out_dir,
-                    f"block_{b:02d}_query_tgt_{query_frame:03d}_tgt_attn.png"
-                )
-                fig.savefig(fpath, dpi=120)
-                plt.close(fig)
 
         # mass summary
         with open(os.path.join(out_dir, "attn_mass.txt"), "w") as fh:

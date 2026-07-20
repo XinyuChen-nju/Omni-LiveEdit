@@ -16,4 +16,7 @@ OUT="${OUT:-outputs/bernini_causvid_edit.mp4}"          # 输出视频路径
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" "$PY" bernini_causvid/inference_edit.py \
     --config "$CONFIG" --ckpt "$CKPT" \
     --source "$SOURCE" --prompt "$PROMPT" --out "$OUT" \
-    --num_frames "${NUM_FRAMES:-21}" --height "${HEIGHT:-480}" --width "${WIDTH:-832}"
+    --num_frames "${NUM_FRAMES:-21}" --height "${HEIGHT:-480}" --width "${WIDTH:-832}" \
+    --vis_attn --attn_per_frame \
+    --attn_layers "${ATTN_LAYERS:-15}" \
+    --attn_out "${ATTN_OUT:-bernini_causvid/outputs/attn_vis}"

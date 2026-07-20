@@ -30,6 +30,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.io import write_video
 
 from bernini_causvid.models.edit_consistency import EditNaiveConsistency
+from bernini_causvid.pipeline.edit_causal_inference import EditCausalInferencePipeline
 from bernini_causvid.data.edit_dataset import EditLatentDataset, edit_collate
 from bernini_causvid.train_common import Logger, append_jsonl, find_latest
 from bernini_causvid import dist_common as D
@@ -37,14 +38,7 @@ from utils.dataset import cycle
 from utils.scheduler import FlowMatchScheduler
 
 
-# 编辑类型（增/删/改）由 prompt 首词区分：add=增、remove=删、replace=改。
-EDIT_KINDS = [("add", "增"), ("remove", "删"), ("replace", "改")]
-
-
-def _edit_kind(prompt):
-    """从指令文本里取出编辑类型首词（去掉前导 '*'、空白等噪声）。"""
-    toks = str(prompt).strip().lstrip("*").strip().split()
-    return toks[0].lower() if toks else ""
+EDIT_KINDS = [("add", "增"), ("remove", "删"), ("replace", "改"), ("style", "风格化")]
 
 
 def load_or_make_neg_embed(cfg, device, is_main):
@@ -75,13 +69,15 @@ def load_or_make_neg_embed(cfg, device, is_main):
 
 
 def select_eval_items(items, kinds):
-    """为每种编辑类型挑第一条样本，返回 {kind: dataset_index}。"""
-    picked = {}
+    """为每种编辑类型挑前两条样本，共 8 个评测样本。"""
+    picked = {k: [] for k in kinds}
     for i, it in enumerate(items):
-        k = _edit_kind(it.get("prompt", ""))
-        if k in kinds and k not in picked:
-            picked[k] = i
-        if len(picked) == len(kinds):
+        k = str(it.get("edit_type", "")).lower()
+        if k == "convert":
+            k = "style"
+        if k in picked and len(picked[k]) < 2:
+            picked[k].append(i)
+        if all(len(v) == 2 for v in picked.values()):
             break
     return picked
 
@@ -98,24 +94,60 @@ def _decode_latent_to_mp4(model, latent, device, dtype, out_path):
 
 @torch.no_grad()
 def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_scheduler,
-                device, dtype, out_path, is_main, sample_steps=-1):
+                device, dtype, out_path, is_main, sample_steps=-1,
+                sample_seed=0):
     """Few-step denoise of one fixed eval clip with the CD EMA student -> mp4.
 
     The generator forward is an FSDP collective, so all ranks run the same sample
     sequence; only rank0 decodes and writes the video.
     """
     cond, _ = build_cond(eval_batch)
-    f = image_or_video_shape[1]
-    shape = [1] + list(image_or_video_shape[1:])
-    latents = torch.randn(shape, device=device, dtype=dtype)
     steps = int(getattr(model.config, "discrete_cd_N", 4)) if sample_steps <= 0 else int(sample_steps)
-    sample_scheduler.set_timesteps(num_inference_steps=steps, denoising_strength=1.0)
-    sample_scheduler.timesteps = sample_scheduler.timesteps.to(device)
-    for t in sample_scheduler.timesteps:
-        timestep = t * torch.ones([1, f], device=device, dtype=dtype)
-        flow, _ = model.generator_ema(noisy_image_or_video=latents,
-                                      conditional_dict=cond, timestep=timestep)
-        latents = sample_scheduler.step(flow, timestep, latents).to(dtype)
+
+    # Build the same shifted few-step schedule used by streamed Causal Forcing.
+    sample_scheduler.set_timesteps(
+        num_inference_steps=steps,
+        denoising_strength=1.0,
+    )
+    step_list = []
+    for t in sample_scheduler.timesteps.round().long().tolist():
+        t = max(0, int(t))
+        if not step_list or t < step_list[-1]:
+            step_list.append(t)
+
+    sample_cfg = OmegaConf.create(
+        OmegaConf.to_container(model.config, resolve=True)
+    )
+    sample_cfg.denoising_step_list = step_list
+    sample_cfg.warp_denoising_step = False
+    sample_cfg.context_noise = float(getattr(model.config, "context_noise", 0.0))
+    sample_cfg.source_noise = float(getattr(model.config, "source_noise", 0.0))
+
+    pipeline = EditCausalInferencePipeline(
+        sample_cfg,
+        device=device,
+        generator=model.generator_ema,
+        text_encoder=None,
+        vae=None,
+    )
+
+    source = cond["source_latents"][0]
+
+    # 同一个评测样本在不同训练 step 使用相同的初始噪声。
+    noise_generator = torch.Generator(device=source.device)
+    noise_generator.manual_seed(int(sample_seed))
+    noise = torch.randn(
+        source.shape,
+        device=source.device,
+        dtype=source.dtype,
+        generator=noise_generator,
+    )
+
+    latents = pipeline.inference(
+        noise=noise,
+        conditional_dict=cond,
+        return_latents=True,
+    )
     if not is_main:
         return None
     mse = None
@@ -301,13 +333,36 @@ def main():
                 with torch.no_grad():
                     u = model.text_encoder(text_prompts=[neg_prompt])
                 uncond_cache = {"prompt_embeds": u["prompt_embeds"][:1].detach()}
-        cond["source_latents"] = [batch["source_latent"].to(device, dtype)]
+        source_latents = [batch["source_latent"].to(device, dtype)]
+
+        # CD 阶段使用干净 source，因此 source 的实际噪声 timestep
+        # 和模型 time embedding 都固定为 0。
+        source_timesteps = [
+            torch.zeros(
+                (src.shape[0], src.shape[1]),
+                device=device,
+                dtype=dtype,
+            )
+            for src in source_latents
+        ]
+
+        cond["source_latents"] = source_latents
+        cond["source_timesteps"] = source_timesteps
+
         if "ref_latents" in batch:
-            cond["ref_latents"] = [r.to(device, dtype) for r in batch["ref_latents"]]
-        uncond = {"prompt_embeds": uncond_cache["prompt_embeds"].expand(b, -1, -1)}
-        uncond["source_latents"] = cond["source_latents"]
+            cond["ref_latents"] = [
+                r.to(device, dtype) for r in batch["ref_latents"]
+            ]
+
+        uncond = {
+            "prompt_embeds": uncond_cache["prompt_embeds"].expand(b, -1, -1)
+        }
+        uncond["source_latents"] = source_latents
+        uncond["source_timesteps"] = source_timesteps
+
         if "ref_latents" in cond:
             uncond["ref_latents"] = cond["ref_latents"]
+
         return cond, uncond
 
     image_or_video_shape = list(cfg.image_or_video_shape)
@@ -316,11 +371,16 @@ def main():
     picked = select_eval_items(dataset.items, kinds)
     eval_specs = []
     for kind in kinds:
-        idx = picked.get(kind)
-        if idx is None:
+        indices = picked.get(kind, [])
+        if not indices:
             log(f"[train] WARN: no '{kind}' sample found in dataset, skipping it")
             continue
-        eval_specs.append((kind, idx, edit_collate([dataset[idx]])))
+
+        for n, idx in enumerate(indices, 1):
+            name = f"{kind}_{n}"
+            eval_specs.append(
+                (name, idx, edit_collate([dataset[idx]]))
+            )
     if not eval_specs:
         eval_specs.append(("sample", 0, edit_collate([dataset[0]])))
 
@@ -365,7 +425,12 @@ def main():
         step += 1
 
         if step >= ema_start_step:
-            D.ema_update_twin(model.generator_ema, model.generator, ema_weight, distributed)
+            D.ema_update_twin(
+                model.generator_ema,
+                model.generator,
+                ema_weight,
+                distributed,
+            )
 
         if step % args.log_every == 0:
             now = time.time(); dt = (now - prev) if prev else 0.0; prev = now
@@ -401,9 +466,12 @@ def main():
             for kind, _idx, eb in eval_specs:
                 try:
                     out = os.path.join(sample_dir, f"step_{step:06d}_{kind}.mp4")
-                    mse = save_sample(model, eb, build_cond, image_or_video_shape,
-                                      sample_scheduler, device, dtype, out, is_main,
-                                      sample_steps=args.sample_steps)
+                    mse = save_sample(
+                        model, eb, build_cond, image_or_video_shape,
+                        sample_scheduler, device, dtype, out, is_main,
+                        sample_steps=args.sample_steps,
+                        sample_seed=int(getattr(cfg, "seed", 0)) + int(_idx),
+                    )
                     if is_main:
                         if mse is not None:
                             sample_mses[kind] = mse
