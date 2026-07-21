@@ -41,30 +41,27 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.io import write_video
 
 from bernini_causvid.models.edit_dmd import EditDMD
-from bernini_causvid.pipeline.edit_causal_inference import EditCausalInferencePipeline
 from bernini_causvid.data.edit_dataset import EditLatentDataset, edit_collate
 from bernini_causvid.train_common import Logger, append_jsonl, find_latest
 from bernini_causvid import dist_common as D
 from utils.dataset import cycle
-from utils.scheduler import FlowMatchScheduler
 
 
-# 编辑类型（增/删/改/风格化），直接读取数据中的 edit_type。
-EDIT_KINDS = [
-    ("add", "增"),
-    ("remove", "删"),
-    ("replace", "改"),
-    ("style", "风格化"),
-]
+# 编辑类型（增/删/改）由 prompt 首词区分：add=增、remove=删、replace=改。
+EDIT_KINDS = [("add", "增"), ("remove", "删"), ("replace", "改")]
+
+
+def _edit_kind(prompt):
+    """从指令文本里取出编辑类型首词（去掉前导 '*'、空白等噪声）。"""
+    toks = str(prompt).strip().lstrip("*").strip().split()
+    return toks[0].lower() if toks else ""
 
 
 def select_eval_items(items, kinds):
     """为每种编辑类型挑第一条样本，返回 {kind: dataset_index}。"""
     picked = {}
     for i, it in enumerate(items):
-        k = str(it.get("edit_type", "")).lower()
-        if k == "convert":
-            k = "style"
+        k = _edit_kind(it.get("prompt", ""))
         if k in kinds and k not in picked:
             picked[k] = i
         if len(picked) == len(kinds):
@@ -83,88 +80,26 @@ def _decode_latent_to_mp4(model, latent, device, dtype, out_path):
 
 
 @torch.no_grad()
-def save_sample(model, sample_batch, build_cond, sample_scheduler,
-                device, dtype, out_path, is_main,
-                sample_steps=4, sample_seed=0):
-    """使用固定噪声进行固定步数的 streamed-causal 推理。"""
+def save_sample(model, sample_batch, build_cond, noise_shape, out_path, is_main):
+    """Decode one generator rollout to an mp4.
+
+    The generator rollout (and the text-encoder forward inside `build_cond`) are
+    FSDP collectives, so EVERY rank must run them in lockstep; only rank 0 decodes
+    the latent with the VAE and writes the video file.
+    """
     cond, _ = build_cond(sample_batch)
-    steps = int(sample_steps)
-
-    sample_scheduler.set_timesteps(
-        num_inference_steps=steps,
-        denoising_strength=1.0,
-    )
-
-    step_list = []
-    for t in sample_scheduler.timesteps.round().long().tolist():
-        t = max(0, int(t))
-        if not step_list or t < step_list[-1]:
-            step_list.append(t)
-
-    sample_cfg = OmegaConf.create(
-        OmegaConf.to_container(model.config, resolve=True)
-    )
-    sample_cfg.denoising_step_list = step_list
-    sample_cfg.warp_denoising_step = False
-    sample_cfg.context_noise = float(
-        getattr(model.config, "context_noise", 0.0)
-    )
-    sample_cfg.source_noise = float(
-        getattr(model.config, "source_noise", 0.0)
-    )
-
-    pipeline = EditCausalInferencePipeline(
-        sample_cfg,
-        device=device,
-        generator=model.generator,
-        text_encoder=None,
-        vae=None,
-    )
-
-    cond = dict(cond)
-    cond["source_timesteps"] = [
-        torch.zeros(
-            (src.shape[0], src.shape[1]),
-            device=src.device,
-            dtype=src.dtype,
-        )
-        for src in cond["source_latents"]
-    ]
-
-    source = cond["source_latents"][0]
-
-    noise_generator = torch.Generator(device=source.device)
-    noise_generator.manual_seed(int(sample_seed))
-    noise = torch.randn(
-        source.shape,
-        device=source.device,
-        dtype=source.dtype,
-        generator=noise_generator,
-    )
-
-    denoised = pipeline.inference(
-        noise=noise,
-        conditional_dict=cond,
-        return_latents=True,
-    )
-
+    denoised, _, _ = model._run_generator(noise_shape(sample_batch), cond)
     if not is_main:
         return None
-
     mse = None
     if "target_latent" in sample_batch:
-        tgt = sample_batch["target_latent"].to(device, dtype)
+        tgt = sample_batch["target_latent"].to(denoised.device, denoised.dtype)
         if tgt.shape == denoised.shape:
-            mse = torch.mean(
-                (denoised.float() - tgt.float()) ** 2
-            ).item()
-
-    pixel = model.vae.decode_to_pixel(denoised)
-    vid = pixel[0].float().clamp(-1, 1)
-    vid = ((vid + 1.0) * 127.5).round().clamp(
-        0, 255
-    ).to(torch.uint8)
-    vid = vid.permute(0, 2, 3, 1).cpu()
+            mse = torch.mean((denoised.float() - tgt.float()) ** 2).item()
+    pixel = model.vae.decode_to_pixel(denoised)    # [B, F, C, H, W] in [-1, 1]
+    vid = pixel[0].float().clamp(-1, 1)            # [F, C, H, W]
+    vid = ((vid + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8)
+    vid = vid.permute(0, 2, 3, 1).cpu()            # [F, H, W, C]
     write_video(out_path, vid, fps=16)
     return mse
 
@@ -179,8 +114,6 @@ def main():
     ap.add_argument("--log_every", type=int, default=10)
     ap.add_argument("--sample_every", type=int, default=-1,
                     help="decode a sample video every N steps; -1 ties it to --save_every, 0 disables")
-    ap.add_argument("--sample_steps", type=int, default=4,
-                    help="fixed streamed-causal inference steps for progress samples")
     ap.add_argument("--grad_accum", type=int, default=-1,
                     help="gradient accumulation steps (micro-batches per optimizer step, "
                          "applied to BOTH generator and critic); "
@@ -257,11 +190,6 @@ def main():
     ema_weight = float(getattr(cfg, "ema_weight", 0.0) or 0.0)
     ema_start_step = int(getattr(cfg, "ema_start_step", 0))
     model = EditDMD(cfg, device=device)
-    sample_scheduler = FlowMatchScheduler(
-        shift=getattr(cfg, "timestep_shift", 5.0),
-        sigma_min=0.0,
-        extra_one_step=True,
-    )
 
     # ---- resume: load weights into the RAW modules BEFORE FSDP shards them --
     # (optimizer states are restored AFTER the optimizers are built, see below)
@@ -501,12 +429,7 @@ def main():
             for kind, _idx, eb in eval_specs:
                 try:
                     out = os.path.join(sample_dir, f"step_{step:06d}_{kind}.mp4")
-                    mse = save_sample(
-                        model, eb, build_cond, sample_scheduler,
-                        device, dtype, out, is_main,
-                        sample_steps=args.sample_steps,
-                        sample_seed=int(getattr(cfg, "seed", 0)) + int(_idx),
-                    )
+                    mse = save_sample(model, eb, build_cond, noise_shape, out, is_main)
                     if is_main:
                         if mse is not None:
                             sample_mses[kind] = mse

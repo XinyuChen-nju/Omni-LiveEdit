@@ -698,10 +698,10 @@ class CausalEditWanModel(CausalWanModel):
                 hidden = torch.utils.checkpoint.checkpoint(
                     blk.forward_edit_stream,
                     hidden, e0, f, h, w, self.freqs, None, rope_start_frame,
-                    tgt_kv_cache[i], current_tgt_start, ctx, None,
+                    tgt_kv_cache[i], current_tgt_start, ctx, crossattn_cache[i],
                     extra_kv=extra_kv,
                     use_reentrant=False,
-                    )
+                    debug=True)
             else:
                 hidden = blk.forward_edit_stream(
                     hidden, e0, f, h, w, self.freqs, None, rope_start_frame,

@@ -691,22 +691,12 @@ class CausalEditWanModel(CausalWanModel):
         e0 = self.time_projection(e).unflatten(1, (6, self.dim)).unflatten(dim=0, sizes=t_target.shape)
         ctx = self._edit_embed_text(context)
 
-        use_ckpt = torch.is_grad_enabled() and getattr(self, "gradient_checkpointing", False)
         for i, blk in enumerate(self.blocks):
             extra_kv = cond_kv_cache[i].visible() if cond_kv_cache is not None else None
-            if use_ckpt:
-                hidden = torch.utils.checkpoint.checkpoint(
-                    blk.forward_edit_stream,
-                    hidden, e0, f, h, w, self.freqs, None, rope_start_frame,
-                    tgt_kv_cache[i], current_tgt_start, ctx, None,
-                    extra_kv=extra_kv,
-                    use_reentrant=False,
-                    )
-            else:
-                hidden = blk.forward_edit_stream(
-                    hidden, e0, f, h, w, self.freqs, None, rope_start_frame,
-                    tgt_kv_cache[i], current_tgt_start, ctx, crossattn_cache[i],
-                    extra_kv=extra_kv)
+            hidden = blk.forward_edit_stream(
+                hidden, e0, f, h, w, self.freqs, None, rope_start_frame,
+                tgt_kv_cache[i], current_tgt_start, ctx, crossattn_cache[i],
+                extra_kv=extra_kv)
 
         hidden = self.head(hidden, e.unflatten(dim=0, sizes=t_target.shape).unsqueeze(2))
         grid = torch.tensor([[f, h, w]], device=device).expand(b, 3)

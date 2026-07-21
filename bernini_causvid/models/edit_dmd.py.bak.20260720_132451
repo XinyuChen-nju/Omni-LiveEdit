@@ -149,21 +149,6 @@ class EditDMD(nn.Module):
         ref = (ref if isinstance(ref, list) else [ref]) if ref is not None else None
         return src, ref
 
-    def _critic_cond(self, conditional_dict, batch_size):
-        """Critic 固定使用 source timestep=0，与 Student rollout 对齐。"""
-        cond = dict(conditional_dict)
-        src = conditional_dict.get("source_latents", None)
-        src = src if isinstance(src, list) else ([src] if src is not None else [])
-        cond["source_timesteps"] = [
-            torch.zeros(
-                (batch_size, 1),
-                device=self.device,
-                dtype=torch.float32,
-            )
-            for _ in src
-        ]
-        return cond
-
     # ------------------------------------------------------------- rollout
     def _run_generator(self, noise_shape, conditional_dict):
         noise = torch.randn(noise_shape, device=self.device, dtype=self.dtype)
@@ -175,11 +160,8 @@ class EditDMD(nn.Module):
     def _compute_kl_grad(self, noisy, x0_est, timestep, conditional_dict,
                          unconditional_dict, normalization=True):
         # fake score (critic): conditioned on text + source
-        critic_cond = self._critic_cond(conditional_dict, noisy.shape[0])
         _, pred_fake = self.fake_score(
-            noisy_image_or_video=noisy,
-            conditional_dict=critic_cond,
-            timestep=timestep)
+            noisy_image_or_video=noisy, conditional_dict=conditional_dict, timestep=timestep)
 
         # real score (teacher): chained multi-condition guided x0
         src, ref = self._split_cond(conditional_dict)
@@ -231,11 +213,8 @@ class EditDMD(nn.Module):
             generated.flatten(0, 1), noise.flatten(0, 1), timestep.flatten(0, 1)
         ).unflatten(0, (b, f))
 
-        critic_cond = self._critic_cond(conditional_dict, noisy.shape[0])
         _, pred_fake = self.fake_score(
-            noisy_image_or_video=noisy,
-            conditional_dict=critic_cond,
-            timestep=timestep)
+            noisy_image_or_video=noisy, conditional_dict=conditional_dict, timestep=timestep)
 
         # flow-matching denoising loss for the critic: the flow implied by the
         # critic's x0 prediction should match the flow implied by the (frozen)

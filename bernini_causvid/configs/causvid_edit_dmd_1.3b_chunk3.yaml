@@ -1,0 +1,80 @@
+# Stage 3：编辑模型的 Causal Forcing / DMD 训练。
+# 使用 Stage 2 causal_cd 的 generator_ema 初始化因果 generator 和双向 fake_score。
+# generator 通过 KV-cache 流式 self-rollout 生成样本，real_score 使用冻结的
+# Bernini 编辑模型提供真实分布评分，fake_score 学习生成样本的噪声预测。
+
+# ---- 模型 / 骨架 -----------------------------------------------------------
+model_name: Bernini-R-1.3B
+model_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Bernini-R-1.3B-Wan
+text_encoder_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+vae_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+causal: true                      # generator 使用因果注意力
+num_frame_per_block: 3            # 每个自回归 block 包含 3 个 latent 帧
+timestep_shift: 5.0               # Flow Matching 时间步偏移
+
+# ---- Stage 2 初始化 --------------------------------------------------------
+# 优先读取 checkpoint 中的 generator_ema；若不存在，才读取 generator。
+# 同一份权重用于初始化因果 generator 和双向 fake_score。
+generator_ckpt: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/runs/bernini_edit_cd_test/20260717_150745/checkpoints/checkpoint_model_002000/model.pt
+allow_raw_bernini_init: false      # 禁止错误地从 Bernini 原始权重直接开始 Stage 3
+
+# ---- Bernini real-score guidance ------------------------------------------
+guidance_mode: v2v_apg
+guidance_scale: 3.0
+omega_v: 1.25                     # 视频条件分支引导权重
+omega_i: 4.5                      # 图像 / source 条件分支引导权重
+omega_ti: 4.0                     # 文本与图像联合条件引导权重
+apg_eta: 0.5
+apg_norm_threshold: 50.0
+
+# ---- DMD / Self-Forcing ---------------------------------------------------
+distribution_loss: dmd
+trainer: score_distillation
+denoising_loss_type: flow
+denoising_step_list:               # generator 的 4 步流式 rollout
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true          # 将上面的原始索引映射为 shift 后的实际 timestep
+ts_schedule: false                 # DMD score timestep 不受 rollout 终止时间限制
+min_score_timestep: 0
+num_train_timestep: 1000
+context_noise: 0                   # 已生成 target 历史以 clean 状态写入 KV cache
+source_noise: 0                    # source condition prefill 使用的 timestep
+dfake_gen_update_ratio: 5          # generator 每 5 个训练 iteration 更新一次；critic 每次更新
+
+# latent 视频几何 [B, F, C, H, W]，对应约 81 帧、480×832 视频。
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+# ---- 优化 ------------------------------------------------------------------
+mixed_precision: true              # bf16 混合精度
+gradient_checkpointing: true       # 梯度检查点，用计算换显存
+batch_size: 2                      # 每卡 micro-batch
+gradient_accumulation_steps: 1    # 每个 optimizer step 累积的 micro-batch 数
+lr: 2.0e-6                         # generator 学习率
+lr_critic: 4.0e-7                  # fake_score 学习率
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+weight_decay: 0.0
+ema_weight: 0.99                   # generator 的 EMA 衰减系数
+ema_start_step: 200                # 从第 200 步开始维护 generator EMA
+seed: 0
+
+# ---- 分布式 / FSDP --------------------------------------------------------
+# full = FULL_SHARD；hybrid_full = HYBRID_SHARD。
+# 当前保持与原始 Causal Forcing chunkwise DMD 配置一致。
+sharding_strategy: hybrid_full
+
+# ---- 数据 ------------------------------------------------------------------
+# DMD loss 只需要 source 和 prompt；target latent 用于训练过程中的参考视频和 MSE。
+data_path: /opt/dlami/nvme/chenxinyu/data/Reco/distill_for_bernini_merged-60000/edit_lat_full/index.json
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'

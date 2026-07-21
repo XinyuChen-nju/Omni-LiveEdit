@@ -83,13 +83,12 @@ class EditSelfForcingTrainingPipeline:
             exit_idx = exit_flags[0] if self.same_step_across_blocks else exit_flags[blk]
 
             # prefill SOURCE block N (clean condition, no grad)
-            with torch.no_grad():
-                self.generator(
-                    stream_mode="prefill_cond",
-                    cond_latent=source[:, sl], source_id=SOURCE_SID, rope_start_frame=fs,
-                    cond_kv_cache=cond_cache, crossattn_cache=crossattn_cache,
-                    current_cond_start=cur_cond_start, conditional_dict=conditional_dict,
-                    cond_timestep=float(self.source_noise))
+            self.generator(
+                stream_mode="prefill_cond",
+                cond_latent=source[:, sl], source_id=SOURCE_SID, rope_start_frame=fs,
+                cond_kv_cache=cond_cache, crossattn_cache=crossattn_cache,
+                current_cond_start=cur_cond_start, conditional_dict=conditional_dict,
+                cond_timestep=float(self.source_noise))
 
             # spatial denoising loop: T -> .. -> tau --grad--> output
             noisy = noise[:, sl]
