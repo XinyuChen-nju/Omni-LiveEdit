@@ -73,6 +73,10 @@ class EditDiffusion(nn.Module):
         # 含 0 使“干净源”在训练分布内 → 推理用干净 source（source_noise=0）即 in-distribution。
         # 与推理端 EditCausalInferencePipeline.source_noise 同义（都是时间步值）。
         self.source_noise_max_t = int(getattr(config, "source_noise_max_timestep", 0) or 0)
+        self.source_timestep_mode = str(
+            getattr(config, "source_timestep_mode", "source")).lower()
+        if self.source_timestep_mode not in ("source", "target"):
+            raise ValueError("source_timestep_mode must be 'source' or 'target'")
 
         # ---- ReCo-style region-reinforced (latent) loss (arXiv:2512.17650) ----
         # Up-weight the EDITING region (where the clean GT target differs from the
@@ -200,9 +204,8 @@ class EditDiffusion(nn.Module):
                 sb, sf = s.shape[:2]
 
                 if self.source_noise_max_t > 0:
-                    # 同一个 t_src 同时用于：
-                    # 1. 给 source latent 加噪；
-                    # 2. source token 的时间调制。
+                    # t_src 始终控制 source latent 的轻噪；模型调制 timestep
+                    # 由 source_timestep_mode 在 t_src / target timestep 间选择。
                     t_src = self._sample_timestep_value(
                         sb, sf, self.source_noise_max_t)
                     s_input = self.scheduler.add_noise(
@@ -220,7 +223,8 @@ class EditDiffusion(nn.Module):
                     s_input = s
 
                 source_inputs.append(s_input)
-                source_timesteps.append(t_src)
+                source_timesteps.append(
+                    timestep if self.source_timestep_mode == "target" else t_src)
 
             conditional_dict = {
                 **conditional_dict,

@@ -30,6 +30,8 @@ noise_augmentation_max_timestep: 100
 # 由于 timesteps≈sigma*1000，此值≈最大噪声占比×1000：100 ≈ 最多 ~10% 噪声（均值 ~5%）。
 # 推理端 EditCausalInferencePipeline.source_noise 同义，建议推理设 0（干净源）。
 source_noise_max_timestep: 100
+# source=用自身 t_src 调制；target=用对应 noisy target 的 t 调制（source 加噪仍用 t_src）。
+source_timestep_mode: target
 num_train_timestep: 1000          # 扩散总时间步数
 denoising_loss_type: flow         # 去噪回归损失：flow（flow-matching）
 

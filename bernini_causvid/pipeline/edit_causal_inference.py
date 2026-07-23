@@ -4,7 +4,7 @@ This is the editing counterpart of `pipeline.causal_inference.CausalInferencePip
 and follows it exactly, with one addition: the editing condition.
 
 Rollout (per latent block N, real-time / self-rollout):
-  1. prefill SOURCE block N into the condition KV-cache (source_id RoPE, clean t),
+  1. prefill SOURCE block N into the condition KV-cache (source_id RoPE),
   2. few-step denoise TARGET block N, attending to [condition cache | target cache],
   3. re-run TARGET block N at `context_noise` to refresh its clean K/V in the cache.
 
@@ -38,6 +38,10 @@ class EditCausalInferencePipeline(torch.nn.Module):
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.context_noise = getattr(args, "context_noise", 0)
         self.source_noise = getattr(args, "source_noise", 0)
+        self.source_timestep_mode = str(
+            getattr(args, "source_timestep_mode", "source")).lower()
+        if self.source_timestep_mode not in ("source", "target"):
+            raise ValueError("source_timestep_mode must be 'source' or 'target'")
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
 
@@ -72,18 +76,33 @@ class EditCausalInferencePipeline(torch.nn.Module):
             cur_cond_start = ref_tokens + fs * frame_seq
             cur_tgt_start = fs * frame_seq
 
-            # 1) prefill SOURCE block N (clean condition, source_id=1)
-            self.generator(
-                stream_mode="prefill_cond",
-                cond_latent=source[:, sl], source_id=SOURCE_SID, rope_start_frame=fs,
-                cond_kv_cache=cond_cache, crossattn_cache=crossattn_cache,
-                current_cond_start=cur_cond_start, conditional_dict=conditional_dict,
-                cond_timestep=float(self.source_noise))
+            # source mode: fixed timestep, so each source block is cached once.
+            if self.source_timestep_mode == "source":
+                self.generator(
+                    stream_mode="prefill_cond",
+                    cond_latent=source[:, sl], source_id=SOURCE_SID, rope_start_frame=fs,
+                    cond_kv_cache=cond_cache, crossattn_cache=crossattn_cache,
+                    current_cond_start=cur_cond_start, conditional_dict=conditional_dict,
+                    cond_timestep=float(self.source_noise))
 
             # 2) few-step denoise TARGET block N
             noisy = noise[:, sl]
             denoised = None
             for i, ts in enumerate(denoise_list):
+                # target mode: source time embedding follows the current target t.
+                # Rebuild all visible source blocks so no stale-timestep K/V remains.
+                if self.source_timestep_mode == "target":
+                    for src_blk in range(blk + 1):
+                        src_fs = src_blk * nfpb
+                        src_sl = slice(src_fs, src_fs + nfpb)
+                        self.generator(
+                            stream_mode="prefill_cond",
+                            cond_latent=source[:, src_sl], source_id=SOURCE_SID,
+                            rope_start_frame=src_fs,
+                            cond_kv_cache=cond_cache, crossattn_cache=crossattn_cache,
+                            current_cond_start=ref_tokens + src_fs * frame_seq,
+                            conditional_dict=conditional_dict,
+                            cond_timestep=float(ts.item()))
                 if attn_rec is not None:
                     attn_rec.set_context(block=blk, step=i, is_refresh=False)
                 timestep = torch.full([b, nfpb], float(ts.item()), device=device, dtype=torch.float32)
