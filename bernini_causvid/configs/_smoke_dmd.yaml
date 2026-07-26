@@ -14,7 +14,13 @@ omega_ti: 4.0
 apg_eta: 0.5
 apg_norm_threshold: 50.0
 generator_ckpt: runs/bernini_edit_ar/20260702_133519/checkpoints/checkpoint_model_002500/model.pt
+fake_score_init: teacher
 allow_raw_bernini_init: false
+source_timestep_mode: target
+source_noise: 0
+context_noise: 0
+score_source_timestep_mode: target
+score_causal_source: false
 distribution_loss: dmd
 denoising_loss_type: flow
 denoising_step_list:
@@ -24,8 +30,10 @@ denoising_step_list:
 - 250
 warp_denoising_step: true
 ts_schedule: false
+min_score_timestep: 0
 num_train_timestep: 1000
-dfake_gen_update_ratio: 2
+generator_start_step: 0
+dfake_gen_update_ratio: 5
 image_or_video_shape:
 - 1
 - 21

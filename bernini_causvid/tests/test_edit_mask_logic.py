@@ -66,6 +66,21 @@ def test_bidirectional_mask():
     print("[ok] bidirectional edit mask: target full, source block-aligned")
 
 
+def test_bidirectional_full_source_mask():
+    fs, nfpb, nfr = 2, 1, 3
+    cond_len = nfr * fs + fs
+    # src_mask_len=0 is the model's causal_source=False path: every condition
+    # token is a globally visible prefix for both real and fake score networks.
+    m = M._prepare_edit_attn_mask(
+        "cpu", cond_len, 0, nfr, fs, nfpb,
+        local_attn_size=-1, bidirectional=True,
+    )
+    all_cond = set(range(cond_len))
+    all_tgt = set(range(cond_len, cond_len + nfr * fs))
+    assert _rows(m, cond_len) & (all_cond | all_tgt) == all_cond | all_tgt
+    print("[ok] bidirectional score mask: full source + full target visibility")
+
+
 def test_tf_mask():
     fs, nfpb, nfr = 2, 1, 3
     src_len = nfr * fs            # 6
@@ -86,5 +101,6 @@ def test_tf_mask():
 if __name__ == "__main__":
     test_causal_mask()
     test_bidirectional_mask()
+    test_bidirectional_full_source_mask()
     test_tf_mask()
     print("ALL PASS")

@@ -45,6 +45,14 @@ class EditDMD(nn.Module):
         vae_path = getattr(config, "vae_path", None)
         nfpb = getattr(config, "num_frame_per_block", 1)
         tshift = getattr(config, "timestep_shift", 5.0)
+        score_causal_source = bool(getattr(config, "score_causal_source", False))
+        self.score_source_timestep_mode = str(
+            getattr(config, "score_source_timestep_mode", "target")
+        ).lower()
+        if self.score_source_timestep_mode not in ("source", "target"):
+            raise ValueError(
+                "score_source_timestep_mode must be 'source' or 'target'"
+            )
 
         # ---- models ------------------------------------------------------
         self.generator = EditDiffusionWrapper(
@@ -52,15 +60,19 @@ class EditDMD(nn.Module):
             num_frame_per_block=nfpb, bidirectional=False,
             model_path=model_path)
         self.generator.model.requires_grad_(True)
+        self.generator.model.causal_source = True
 
         self.fake_score = EditDiffusionWrapper(
             model_name=model_name, timestep_shift=tshift,
             num_frame_per_block=nfpb, bidirectional=True,
             model_path=model_path)
         self.fake_score.model.requires_grad_(True)
+        self.fake_score.model.causal_source = score_causal_source
 
         self.real_score = BerniniEditTeacher(
             model_name=model_name, model_path=model_path, timestep_shift=tshift,
+            num_frame_per_block=nfpb,
+            causal_source=score_causal_source,
             guidance_mode=getattr(config, "guidance_mode", "v2v_apg"),
             omega_v=getattr(config, "omega_v", 1.25),
             omega_i=getattr(config, "omega_i", 4.5),
@@ -69,19 +81,42 @@ class EditDMD(nn.Module):
             apg_norm_threshold=getattr(config, "apg_norm_threshold", 50.0))
         self.real_score.requires_grad_(False)
 
-        self.text_encoder = WanTextEncoder(
-            text_encoder_path=text_encoder_path,
-            tokenizer_path=tokenizer_path).requires_grad_(False)
+        # Full ReCo indexes already carry precomputed prompt embeddings. Matching
+        # Stage 1/2, skip constructing umT5 entirely in that mode (~11 GB/rank
+        # plus an expensive FSDP all-gather during startup).
+        self.use_cached_text_embeds = bool(
+            getattr(config, "cache_text_embeds", False)
+        )
+        if self.use_cached_text_embeds:
+            self.text_encoder = None
+        else:
+            self.text_encoder = WanTextEncoder(
+                text_encoder_path=text_encoder_path,
+                tokenizer_path=tokenizer_path,
+            ).requires_grad_(False)
         self.vae = WanVAEWrapper(vae_path=vae_path).requires_grad_(False)
 
-        # Stage-2 initialisation: load a causal-edit checkpoint (causal_cd / causal_ode
-        # / ar_diffusion) into the generator and the critic so DMD starts from the
-        # few-step initialisation rather than the raw bidirectional Bernini weights.
+        # Match the original Causal-Forcing DMD initialisation:
+        #   generator  <- Stage-2 causal checkpoint
+        #   fake_score <- pretrained bidirectional score model (already loaded above)
+        # Loading causal few-step weights into the bidirectional critic is kept only
+        # as an explicit ablation; it is not the default.
+        fake_score_init = str(
+            getattr(config, "fake_score_init", "teacher")
+        ).lower()
+        if fake_score_init not in ("teacher", "generator"):
+            raise ValueError("fake_score_init must be 'teacher' or 'generator'")
         ckpt = getattr(config, "generator_ckpt", None)
         if ckpt:
             state = load_edit_generator_state(ckpt)
             report_load_state(self.generator, state, tag="EditDMD.generator")
-            report_load_state(self.fake_score, state, tag="EditDMD.critic")
+            if fake_score_init == "generator":
+                report_load_state(self.fake_score, state, tag="EditDMD.critic")
+            else:
+                print(
+                    "[EditDMD] fake_score keeps pretrained bidirectional "
+                    "Bernini initialisation"
+                )
         elif not getattr(config, "allow_raw_bernini_init", False):
             # Stage 3 DMD is a few-step distillation: it must start from a few-step
             # causal checkpoint (Stage 2 CF++ / ODE), NOT the raw bidirectional
@@ -120,6 +155,9 @@ class EditDMD(nn.Module):
             num_frame_per_block=nfpb,
             context_noise=getattr(config, "context_noise", 0),
             source_noise=getattr(config, "source_noise", 0),
+            source_timestep_mode=getattr(
+                config, "source_timestep_mode", "target"
+            ),
             same_step_across_blocks=True)
         self.num_train_timestep = getattr(config, "num_train_timestep", 1000)
         self.min_step = int(0.02 * self.num_train_timestep)
@@ -149,19 +187,27 @@ class EditDMD(nn.Module):
         ref = (ref if isinstance(ref, list) else [ref]) if ref is not None else None
         return src, ref
 
-    def _critic_cond(self, conditional_dict, batch_size):
-        """Critic 固定使用 source timestep=0，与 Student rollout 对齐。"""
+    def _score_cond(self, conditional_dict, timestep):
+        """Give fake/real score networks identical source-time semantics.
+
+        Score networks default to Bernini's native packed-condition behaviour:
+        clean source latents are time-modulated at the current noisy-target
+        timestep. ``source`` mode is retained as an explicit ablation.
+        """
         cond = dict(conditional_dict)
         src = conditional_dict.get("source_latents", None)
         src = src if isinstance(src, list) else ([src] if src is not None else [])
-        cond["source_timesteps"] = [
-            torch.zeros(
-                (batch_size, 1),
-                device=self.device,
-                dtype=torch.float32,
-            )
-            for _ in src
-        ]
+        if self.score_source_timestep_mode == "target":
+            cond["source_timesteps"] = [timestep for _ in src]
+        else:
+            cond["source_timesteps"] = [
+                torch.zeros(
+                    (timestep.shape[0], s.shape[1]),
+                    device=timestep.device,
+                    dtype=timestep.dtype,
+                )
+                for s in src
+            ]
         return cond
 
     # ------------------------------------------------------------- rollout
@@ -174,20 +220,19 @@ class EditDMD(nn.Module):
     # --------------------------------------------------------- DMD grad
     def _compute_kl_grad(self, noisy, x0_est, timestep, conditional_dict,
                          unconditional_dict, normalization=True):
-        # fake score (critic): conditioned on text + source
-        critic_cond = self._critic_cond(conditional_dict, noisy.shape[0])
+        # Both score networks must see the same source timestep and visibility.
+        score_cond = self._score_cond(conditional_dict, timestep)
         _, pred_fake = self.fake_score(
-            noisy_image_or_video=noisy,
-            conditional_dict=critic_cond,
-            timestep=timestep)
+            noisy_image_or_video=noisy, conditional_dict=score_cond, timestep=timestep)
 
         # real score (teacher): chained multi-condition guided x0
-        src, ref = self._split_cond(conditional_dict)
+        src, ref = self._split_cond(score_cond)
         pred_real = self.real_score.predict_real(
             noisy_image_or_video=noisy, timestep=timestep,
             text_cond=conditional_dict["prompt_embeds"],
             text_uncond=unconditional_dict["prompt_embeds"],
-            source_latents=src, ref_latents=ref)
+            source_latents=src, ref_latents=ref,
+            source_timesteps=score_cond.get("source_timesteps"))
 
         grad = pred_fake - pred_real
         if normalization:
@@ -231,11 +276,9 @@ class EditDMD(nn.Module):
             generated.flatten(0, 1), noise.flatten(0, 1), timestep.flatten(0, 1)
         ).unflatten(0, (b, f))
 
-        critic_cond = self._critic_cond(conditional_dict, noisy.shape[0])
+        score_cond = self._score_cond(conditional_dict, timestep)
         _, pred_fake = self.fake_score(
-            noisy_image_or_video=noisy,
-            conditional_dict=critic_cond,
-            timestep=timestep)
+            noisy_image_or_video=noisy, conditional_dict=score_cond, timestep=timestep)
 
         # flow-matching denoising loss for the critic: the flow implied by the
         # critic's x0 prediction should match the flow implied by the (frozen)

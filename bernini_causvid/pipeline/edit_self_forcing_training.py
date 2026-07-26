@@ -22,12 +22,14 @@ import torch
 import torch.distributed as dist
 
 from .edit_stream_common import (
-    alloc_edit_caches, edit_frame_seq, get_source_refs, prefill_refs, SOURCE_SID)
+    alloc_edit_caches, edit_frame_seq, get_source_refs, prefill_refs,
+    refresh_visible_source, SOURCE_SID)
 
 
 class EditSelfForcingTrainingPipeline:
     def __init__(self, denoising_step_list, scheduler, generator,
                  num_frame_per_block=1, context_noise=0, source_noise=0,
+                 source_timestep_mode="target",
                  same_step_across_blocks=True, last_step_only=False, **kwargs):
         self.scheduler = scheduler
         self.generator = generator
@@ -37,6 +39,11 @@ class EditSelfForcingTrainingPipeline:
         self.num_frame_per_block = num_frame_per_block
         self.context_noise = context_noise
         self.source_noise = source_noise
+        self.source_timestep_mode = str(source_timestep_mode).lower()
+        if self.source_timestep_mode not in ("source", "target"):
+            raise ValueError(
+                "source_timestep_mode must be 'source' or 'target'"
+            )
         self.same_step_across_blocks = same_step_across_blocks
         self.last_step_only = last_step_only
 
@@ -82,19 +89,33 @@ class EditSelfForcingTrainingPipeline:
             cur_tgt_start = fs * frame_seq
             exit_idx = exit_flags[0] if self.same_step_across_blocks else exit_flags[blk]
 
-            # prefill SOURCE block N (clean condition, no grad)
-            with torch.no_grad():
-                self.generator(
-                    stream_mode="prefill_cond",
-                    cond_latent=source[:, sl], source_id=SOURCE_SID, rope_start_frame=fs,
-                    cond_kv_cache=cond_cache, crossattn_cache=crossattn_cache,
-                    current_cond_start=cur_cond_start, conditional_dict=conditional_dict,
-                    cond_timestep=float(self.source_noise))
+            # Fixed source-time mode caches each source block once. Target-time
+            # mode refreshes all visible source blocks inside the denoising loop.
+            if self.source_timestep_mode == "source":
+                with torch.no_grad():
+                    self.generator(
+                        stream_mode="prefill_cond",
+                        cond_latent=source[:, sl], source_id=SOURCE_SID,
+                        rope_start_frame=fs,
+                        cond_kv_cache=cond_cache,
+                        crossattn_cache=crossattn_cache,
+                        current_cond_start=cur_cond_start,
+                        conditional_dict=conditional_dict,
+                        cond_timestep=float(self.source_noise))
 
             # spatial denoising loop: T -> .. -> tau --grad--> output
             noisy = noise[:, sl]
             denoised = None
             for index, ts in enumerate(denoise_list):
+                if self.source_timestep_mode == "target":
+                    # Stage-1 dense training modulates source tokens with the
+                    # matching target timestep. Rebuild every visible source block
+                    # so its cached K/V uses this denoising step (no stale K/V).
+                    with torch.no_grad():
+                        refresh_visible_source(
+                            self.generator, conditional_dict, source,
+                            cond_cache, crossattn_cache, frame_seq, ref_tokens,
+                            nfpb, blk, float(ts.item()))
                 timestep = torch.full([b, nfpb], float(ts.item()), device=device, dtype=torch.float32)
                 if index != exit_idx:
                     with torch.no_grad():

@@ -25,8 +25,8 @@ def edit_frame_seq(generator, h, w):
 
 
 def get_source_refs(conditional_dict):
-    src = conditional_dict.get("source_latents", [])
-    src = src[0] if isinstance(src, list) else src
+    src = conditional_dict.get("source_latents")
+    src = src[0] if isinstance(src, list) and src else src
     refs = conditional_dict.get("ref_latents", []) or []
     if not isinstance(refs, list):
         refs = [refs]
@@ -77,3 +77,39 @@ def prefill_refs(generator, conditional_dict, refs, cond_cache, crossattn_cache,
         cursor += r.shape[1] * frame_seq
         sid += 1
     return cursor
+
+
+def refresh_visible_source(
+    generator,
+    conditional_dict,
+    source,
+    cond_cache,
+    crossattn_cache,
+    frame_seq,
+    ref_tokens,
+    num_frame_per_block,
+    last_visible_block,
+    cond_timestep,
+):
+    """Overwrite all currently visible source blocks at one time embedding.
+
+    In ``source_timestep_mode=target`` the source K/V depends on the current
+    target denoising timestep. Rewriting only the newest source block would leave
+    older visible blocks with stale K/V from a different timestep, so every
+    visible source block is overwritten before the matching target forward.
+    """
+    nfpb = num_frame_per_block
+    for src_blk in range(last_visible_block + 1):
+        src_fs = src_blk * nfpb
+        src_sl = slice(src_fs, src_fs + nfpb)
+        generator(
+            stream_mode="prefill_cond",
+            cond_latent=source[:, src_sl],
+            source_id=SOURCE_SID,
+            rope_start_frame=src_fs,
+            cond_kv_cache=cond_cache,
+            crossattn_cache=crossattn_cache,
+            current_cond_start=ref_tokens + src_fs * frame_seq,
+            conditional_dict=conditional_dict,
+            cond_timestep=float(cond_timestep),
+        )

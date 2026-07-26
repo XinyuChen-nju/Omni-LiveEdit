@@ -17,7 +17,8 @@ import torch
 import tqdm
 
 from .edit_stream_common import (
-    alloc_edit_caches, edit_frame_seq, get_source_refs, prefill_refs, SOURCE_SID)
+    alloc_edit_caches, edit_frame_seq, get_source_refs, prefill_refs,
+    refresh_visible_source, SOURCE_SID)
 from ..models.attn_vis import get_recorder
 
 
@@ -47,7 +48,8 @@ class EditCausalInferencePipeline(torch.nn.Module):
 
     @torch.no_grad()
     def inference(self, noise: torch.Tensor, conditional_dict: dict,
-                  return_latents: bool = True) -> torch.Tensor:
+                  return_latents: bool = True,
+                  rng: torch.Generator = None) -> torch.Tensor:
         """noise: [B, F, C, H, W]; conditional_dict carries prompt_embeds +
         source_latents (list of [B,F,C,H,W]) + optional ref_latents (list of [B,1,C,H,W])."""
         b, num_frames, c, h, w = noise.shape
@@ -92,17 +94,10 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 # target mode: source time embedding follows the current target t.
                 # Rebuild all visible source blocks so no stale-timestep K/V remains.
                 if self.source_timestep_mode == "target":
-                    for src_blk in range(blk + 1):
-                        src_fs = src_blk * nfpb
-                        src_sl = slice(src_fs, src_fs + nfpb)
-                        self.generator(
-                            stream_mode="prefill_cond",
-                            cond_latent=source[:, src_sl], source_id=SOURCE_SID,
-                            rope_start_frame=src_fs,
-                            cond_kv_cache=cond_cache, crossattn_cache=crossattn_cache,
-                            current_cond_start=ref_tokens + src_fs * frame_seq,
-                            conditional_dict=conditional_dict,
-                            cond_timestep=float(ts.item()))
+                    refresh_visible_source(
+                        self.generator, conditional_dict, source,
+                        cond_cache, crossattn_cache, frame_seq, ref_tokens,
+                        nfpb, blk, float(ts.item()))
                 if attn_rec is not None:
                     attn_rec.set_context(block=blk, step=i, is_refresh=False)
                 timestep = torch.full([b, nfpb], float(ts.item()), device=device, dtype=torch.float32)
@@ -115,8 +110,15 @@ class EditCausalInferencePipeline(torch.nn.Module):
                     rope_start_frame=fs, current_tgt_start=cur_tgt_start)
                 if i < len(denoise_list) - 1:
                     nts = float(denoise_list[i + 1].item())
+                    transition_noise = torch.randn(
+                        denoised.shape,
+                        device=denoised.device,
+                        dtype=denoised.dtype,
+                        generator=rng,
+                    )
                     noisy = self.scheduler.add_noise(
-                        denoised.flatten(0, 1), torch.randn_like(denoised.flatten(0, 1)),
+                        denoised.flatten(0, 1),
+                        transition_noise.flatten(0, 1),
                         torch.full([b * nfpb], nts, device=device, dtype=torch.float32),
                     ).unflatten(0, (b, nfpb))
 

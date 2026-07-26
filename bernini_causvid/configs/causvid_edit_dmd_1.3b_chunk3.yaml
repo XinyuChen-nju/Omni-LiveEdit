@@ -1,7 +1,6 @@
 # Stage 3：编辑模型的 Causal Forcing / DMD 训练。
-# 使用 Stage 2 causal_cd 的 generator_ema 初始化因果 generator 和双向 fake_score。
-# generator 通过 KV-cache 流式 self-rollout 生成样本，real_score 使用冻结的
-# Bernini 编辑模型提供真实分布评分，fake_score 学习生成样本的噪声预测。
+# generator 使用 Stage 2 causal_cd 的 generator_ema；fake_score 和 real_score
+# 从预训练双向 Bernini 初始化。fake_score 随训练拟合 generator 当前分布。
 
 # ---- 模型 / 骨架 -----------------------------------------------------------
 model_name: Bernini-R-1.3B
@@ -13,11 +12,26 @@ causal: true                      # generator 使用因果注意力
 num_frame_per_block: 3            # 每个自回归 block 包含 3 个 latent 帧
 timestep_shift: 5.0               # Flow Matching 时间步偏移
 
+# 数据 index 已包含预计算 prompt embedding。跳过 umT5 可显著降低每卡显存。
+cache_text_embeds: true
+
 # ---- Stage 2 初始化 --------------------------------------------------------
-# 优先读取 checkpoint 中的 generator_ema；若不存在，才读取 generator。
-# 同一份权重用于初始化因果 generator 和双向 fake_score。
+# 只把 Stage 2 generator_ema 加载给因果 generator。fake-score 默认保留
+# 预训练双向 Bernini；generator 模式仅用于显式消融。
 generator_ckpt: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/runs/bernini_edit_cd_test/20260717_150745/checkpoints/checkpoint_model_002000/model.pt
+fake_score_init: teacher             # teacher | generator
 allow_raw_bernini_init: false      # 禁止错误地从 Bernini 原始权重直接开始 Stage 3
+
+# ---- source 条件语义 -------------------------------------------------------
+# generator 的 clean source token 跟随当前 target timestep 调制；每个去噪步
+# 重写所有当前可见 source K/V，避免缓存混入上一 timestep。
+source_timestep_mode: target          # target | source
+source_noise: 0                       # source 模式下使用的固定 timestep
+context_noise: 0                      # target 历史写回 cache 的 timestep
+
+# real/fake score 必须使用相同 source timestep、block 和可见范围。
+score_source_timestep_mode: target     # target | source
+score_causal_source: false             # 双向 score 可见完整 source
 
 # ---- Bernini real-score guidance ------------------------------------------
 guidance_mode: v2v_apg
@@ -41,8 +55,7 @@ warp_denoising_step: true          # 将上面的原始索引映射为 shift 后
 ts_schedule: false                 # DMD score timestep 不受 rollout 终止时间限制
 min_score_timestep: 0
 num_train_timestep: 1000
-context_noise: 0                   # 已生成 target 历史以 clean 状态写入 KV cache
-source_noise: 0                    # source condition prefill 使用的 timestep
+generator_start_step: 0            # 保持原始 Causal-Forcing：从 internal step 0 更新
 dfake_gen_update_ratio: 5          # generator 每 5 个训练 iteration 更新一次；critic 每次更新
 
 # latent 视频几何 [B, F, C, H, W]，对应约 81 帧、480×832 视频。

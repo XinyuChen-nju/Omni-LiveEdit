@@ -46,7 +46,6 @@ from bernini_causvid.data.edit_dataset import EditLatentDataset, edit_collate
 from bernini_causvid.train_common import Logger, append_jsonl, find_latest
 from bernini_causvid import dist_common as D
 from utils.dataset import cycle
-from utils.scheduler import FlowMatchScheduler
 
 
 # 编辑类型（增/删/改/风格化），直接读取数据中的 edit_type。
@@ -72,6 +71,28 @@ def select_eval_items(items, kinds):
     return picked
 
 
+def load_negative_prompt_embed(cfg):
+    """Load a precomputed negative-prompt embedding as [1, L, D]."""
+    path = getattr(cfg, "negative_prompt_embed_path", None)
+    if not path:
+        idx_dir = os.path.dirname(os.path.abspath(cfg.data_path))
+        path = os.path.join(idx_dir, "text_embeds", "_negative_txt.pt")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            "cache_text_embeds is enabled but the negative prompt embedding "
+            f"is missing: {path}. Generate it once before distributed training."
+        )
+    emb = torch.load(path, map_location="cpu")
+    if emb.dim() == 2:
+        emb = emb.unsqueeze(0)
+    if emb.dim() != 3 or emb.shape[0] != 1:
+        raise ValueError(
+            f"negative prompt embedding must be [L,D] or [1,L,D], got "
+            f"{tuple(emb.shape)} from {path}"
+        )
+    return emb
+
+
 @torch.no_grad()
 def _decode_latent_to_mp4(model, latent, device, dtype, out_path):
     """把一段干净 latent（源/目标）解码成 mp4，仅供 rank0 写参考视频。"""
@@ -83,36 +104,22 @@ def _decode_latent_to_mp4(model, latent, device, dtype, out_path):
 
 
 @torch.no_grad()
-def save_sample(model, sample_batch, build_cond, sample_scheduler,
-                device, dtype, out_path, is_main,
-                sample_steps=4, sample_seed=0):
-    """使用固定噪声进行固定步数的 streamed-causal 推理。"""
+def save_sample(model, sample_batch, build_cond, device, dtype, out_path,
+                is_main, sample_seed=0):
+    """Run deterministic full-step inference and decode one sample to mp4.
+
+    Every rank participates in the FSDP forwards. Initial and transition noise use
+    one explicit RNG, so the same checkpoint and seed reproduce the same trajectory.
+    """
     cond, _ = build_cond(sample_batch)
-    steps = int(sample_steps)
-
-    sample_scheduler.set_timesteps(
-        num_inference_steps=steps,
-        denoising_strength=1.0,
-    )
-
-    step_list = []
-    for t in sample_scheduler.timesteps.round().long().tolist():
-        t = max(0, int(t))
-        if not step_list or t < step_list[-1]:
-            step_list.append(t)
 
     sample_cfg = OmegaConf.create(
         OmegaConf.to_container(model.config, resolve=True)
     )
-    sample_cfg.denoising_step_list = step_list
+    sample_cfg.denoising_step_list = [
+        float(t) for t in model.denoising_step_list.detach().cpu().tolist()
+    ]
     sample_cfg.warp_denoising_step = False
-    sample_cfg.context_noise = float(
-        getattr(model.config, "context_noise", 0.0)
-    )
-    sample_cfg.source_noise = float(
-        getattr(model.config, "source_noise", 0.0)
-    )
-
     pipeline = EditCausalInferencePipeline(
         sample_cfg,
         device=device,
@@ -121,50 +128,32 @@ def save_sample(model, sample_batch, build_cond, sample_scheduler,
         vae=None,
     )
 
-    cond = dict(cond)
-    cond["source_timesteps"] = [
-        torch.zeros(
-            (src.shape[0], src.shape[1]),
-            device=src.device,
-            dtype=src.dtype,
-        )
-        for src in cond["source_latents"]
-    ]
-
     source = cond["source_latents"][0]
-
-    noise_generator = torch.Generator(device=source.device)
-    noise_generator.manual_seed(int(sample_seed))
+    rng = torch.Generator(device=source.device)
+    rng.manual_seed(int(sample_seed))
     noise = torch.randn(
         source.shape,
         device=source.device,
         dtype=source.dtype,
-        generator=noise_generator,
+        generator=rng,
     )
-
     denoised = pipeline.inference(
         noise=noise,
         conditional_dict=cond,
         return_latents=True,
+        rng=rng,
     )
-
     if not is_main:
         return None
-
     mse = None
     if "target_latent" in sample_batch:
-        tgt = sample_batch["target_latent"].to(device, dtype)
+        tgt = sample_batch["target_latent"].to(denoised.device, denoised.dtype)
         if tgt.shape == denoised.shape:
-            mse = torch.mean(
-                (denoised.float() - tgt.float()) ** 2
-            ).item()
-
-    pixel = model.vae.decode_to_pixel(denoised)
-    vid = pixel[0].float().clamp(-1, 1)
-    vid = ((vid + 1.0) * 127.5).round().clamp(
-        0, 255
-    ).to(torch.uint8)
-    vid = vid.permute(0, 2, 3, 1).cpu()
+            mse = torch.mean((denoised.float() - tgt.float()) ** 2).item()
+    pixel = model.vae.decode_to_pixel(denoised)    # [B, F, C, H, W] in [-1, 1]
+    vid = pixel[0].float().clamp(-1, 1)            # [F, C, H, W]
+    vid = ((vid + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8)
+    vid = vid.permute(0, 2, 3, 1).cpu()            # [F, H, W, C]
     write_video(out_path, vid, fps=16)
     return mse
 
@@ -179,8 +168,10 @@ def main():
     ap.add_argument("--log_every", type=int, default=10)
     ap.add_argument("--sample_every", type=int, default=-1,
                     help="decode a sample video every N steps; -1 ties it to --save_every, 0 disables")
-    ap.add_argument("--sample_steps", type=int, default=4,
-                    help="fixed streamed-causal inference steps for progress samples")
+    ap.add_argument("--sample_seed", type=int, default=0,
+                    help="fixed seed for the complete progress-sample noise trajectory")
+    ap.add_argument("--sample_at_start", action="store_true",
+                    help="write a fixed raw-generator baseline before the first update")
     ap.add_argument("--grad_accum", type=int, default=-1,
                     help="gradient accumulation steps (micro-batches per optimizer step, "
                          "applied to BOTH generator and critic); "
@@ -257,11 +248,6 @@ def main():
     ema_weight = float(getattr(cfg, "ema_weight", 0.0) or 0.0)
     ema_start_step = int(getattr(cfg, "ema_start_step", 0))
     model = EditDMD(cfg, device=device)
-    sample_scheduler = FlowMatchScheduler(
-        shift=getattr(cfg, "timestep_shift", 5.0),
-        sigma_min=0.0,
-        extra_one_step=True,
-    )
 
     # ---- resume: load weights into the RAW modules BEFORE FSDP shards them --
     # (optimizer states are restored AFTER the optimizers are built, see below)
@@ -291,8 +277,9 @@ def main():
         # real_score (BerniniEditTeacher) is entered via `predict_real`, not
         # `__call__`, so FSDP hooks would never fire -> keep it replicated bf16.
         model.real_score = model.real_score.to(device).to(dtype)
-        model.text_encoder = D.fsdp_wrap_single(
-            model.text_encoder, sharding, cfg.mixed_precision)
+        if model.text_encoder is not None:
+            model.text_encoder = D.fsdp_wrap_single(
+                model.text_encoder, sharding, cfg.mixed_precision)
         model.vae = model.vae.to(device).to(dtype)
         # The KV-cache self-rollout drives the generator via `forward(stream_mode=...)`;
         # point it at the FSDP-wrapped module so the all-gather + bf16 cast fire
@@ -302,7 +289,8 @@ def main():
         model.generator = model.generator.to(device).to(dtype)
         model.fake_score = model.fake_score.to(device).to(dtype)
         model.real_score = model.real_score.to(device).to(dtype)
-        model.text_encoder = model.text_encoder.to(device)
+        if model.text_encoder is not None:
+            model.text_encoder = model.text_encoder.to(device)
         model.vae = model.vae.to(device).to(dtype)
 
     gen_opt = torch.optim.AdamW(
@@ -337,20 +325,51 @@ def main():
 
     neg_prompt = cfg.negative_prompt
     uncond_cache = None
+    neg_embed = (
+        load_negative_prompt_embed(cfg)
+        if model.text_encoder is None
+        else None
+    )
+    if model.text_encoder is None:
+        log(
+            "[train] cache_text_embeds: umT5 encoder dropped; using batch "
+            "prompt embeddings and cached negative embedding"
+        )
 
     def build_cond(batch):
         nonlocal uncond_cache
         prompts = batch["prompts"]
-        with torch.no_grad():
-            cond = model.text_encoder(text_prompts=prompts)
-            if uncond_cache is None:
-                u = model.text_encoder(text_prompts=[neg_prompt] * len(prompts))
-                uncond_cache = {k: v.detach() for k, v in u.items()}
-        cond = dict(cond)
+        b = len(prompts)
+        if "prompt_embeds" in batch:
+            cond = {"prompt_embeds": batch["prompt_embeds"].to(device, dtype)}
+        elif model.text_encoder is not None:
+            with torch.no_grad():
+                cond = dict(model.text_encoder(text_prompts=prompts))
+        else:
+            raise RuntimeError(
+                "cache_text_embeds is enabled but this batch has no "
+                "`prompt_embeds`; generate text embeds for the data index."
+            )
+        if uncond_cache is None:
+            if neg_embed is not None:
+                uncond_cache = {
+                    "prompt_embeds": neg_embed.to(device, dtype)
+                }
+            else:
+                with torch.no_grad():
+                    u = model.text_encoder(text_prompts=[neg_prompt])
+                uncond_cache = {
+                    "prompt_embeds": u["prompt_embeds"][:1].detach()
+                }
         cond["source_latents"] = [batch["source_latent"].to(device, dtype)]
         if "ref_latents" in batch:
             cond["ref_latents"] = [r.to(device, dtype) for r in batch["ref_latents"]]
-        return cond, uncond_cache
+        uncond = {
+            "prompt_embeds": uncond_cache["prompt_embeds"].expand(
+                b, -1, -1
+            )
+        }
+        return cond, uncond
 
     def noise_shape(batch):
         s = batch["source_latent"].shape  # [B,F,C,H,W]
@@ -370,7 +389,15 @@ def main():
         eval_specs.append(("sample", 0, edit_collate([dataset[0]])))
 
     if is_main:
-        meta = {"data_path": cfg.data_path, "samples": {}}
+        meta = {
+            "data_path": cfg.data_path,
+            "progress_sample_weights": "raw_generator",
+            "deployment_eval_weights": (
+                "generator_ema from a saved checkpoint when available"
+            ),
+            "sample_seed": args.sample_seed,
+            "samples": {},
+        }
         for kind, idx, eb in eval_specs:
             meta["samples"][kind] = {"index": idx,
                                      "prompt": dataset.items[idx].get("prompt", "")}
@@ -388,25 +415,87 @@ def main():
 
     log("[train] eval samples: "
         + ", ".join(f"{k}=#{i}" for k, i, _ in eval_specs))
-    log(f"[train] start at step {step}, max_iters {args.max_iters} | sample_every={sample_every}")
+    generator_start_step = int(getattr(cfg, "generator_start_step", 0))
+    update_ratio = int(cfg.dfake_gen_update_ratio)
+    if generator_start_step < 0 or update_ratio <= 0:
+        raise ValueError(
+            "generator_start_step must be >= 0 and dfake_gen_update_ratio must be > 0"
+        )
+    log(
+        f"[train] start at step {step}, max_iters {args.max_iters} "
+        f"| sample_every={sample_every} | generator_start_step={generator_start_step} "
+        f"| gen_update_ratio={update_ratio} "
+        f"| source_timestep_mode={getattr(cfg, 'source_timestep_mode', 'target')} "
+        f"| score_source_timestep_mode="
+        f"{getattr(cfg, 'score_source_timestep_mode', 'target')}"
+    )
+
+    def write_progress_samples(sample_step):
+        sample_mses = {}
+        for kind, _idx, eb in eval_specs:
+            try:
+                out = os.path.join(
+                    sample_dir,
+                    f"step_{sample_step:06d}_raw_{kind}.mp4",
+                )
+                mse = save_sample(
+                    model, eb, build_cond, device, dtype, out, is_main,
+                    sample_seed=args.sample_seed,
+                )
+                if is_main:
+                    if mse is not None:
+                        sample_mses[kind] = mse
+                    log(f"[train] wrote raw-generator sample {out}"
+                        + (f" | mse {mse:.4f}" if mse is not None else ""))
+            except Exception as e:  # sampling must never kill training
+                log(
+                    f"[train] sample '{kind}' failed at step "
+                    f"{sample_step}: {e}"
+                )
+        if is_main and sample_mses:
+            mean_mse = sum(sample_mses.values()) / len(sample_mses)
+            rec = {
+                "step": sample_step,
+                "sample_mse_mean": mean_mse,
+                "time": datetime.now().isoformat(),
+            }
+            for k, v in sample_mses.items():
+                rec[f"sample_mse_{k}"] = v
+                writer.add_scalar(f"sample/mse_{k}", v, sample_step)
+            writer.add_scalar("sample/mse_mean", mean_mse, sample_step)
+            append_jsonl(sample_metrics_path, rec)
+            log("[train] sample mse mean {:.4f} (".format(mean_mse)
+                + ", ".join(f"{k}={v:.4f}" for k, v in sample_mses.items()) + ")")
+
+    if args.sample_at_start:
+        write_progress_samples(step)
+
     prev = None
     last_gen_loss = float("nan")
     last_crit_loss = float("nan")
     last_grad_norm = float("nan")
+    last_dmd_grad_norm = float("nan")
     while step < args.max_iters:
-        train_gen = (step % cfg.dfake_gen_update_ratio == 0)
+        train_gen = (
+            step >= generator_start_step
+            and (step - generator_start_step) % update_ratio == 0
+        )
 
         # 每个 optimizer.step 前累积 grad_accum 个 micro-batch 的梯度；
         # loss 除以 grad_accum，使累积梯度等于这些 micro-batch 的平均梯度。
         if train_gen:
             gen_opt.zero_grad(set_to_none=True)
             accum_gen_loss = 0.0
+            accum_dmd_grad_norm = 0.0
             for _ in range(grad_accum):
                 batch = next(data)
                 cond, uncond = build_cond(batch)
                 loss, gen_log = model.generator_loss(noise_shape(batch), cond, uncond)
                 (loss / grad_accum).backward()
                 accum_gen_loss += loss.item()
+                accum_dmd_grad_norm += float(
+                    gen_log["dmdtrain_gradient_norm"]
+                )
             gnorm = D.clip_grad_norm_(model.generator, 10.0, distributed)
             if os.environ.get("GRAD_DIAG"):
                 import torch.distributed as _dist
@@ -430,6 +519,7 @@ def main():
             gen_opt.step()
             last_gen_loss = accum_gen_loss / grad_accum
             last_grad_norm = float(gnorm)
+            last_dmd_grad_norm = accum_dmd_grad_norm / grad_accum
 
             if ema_weight > 0.0 and step >= ema_start_step:
                 if ema is None:
@@ -457,8 +547,10 @@ def main():
             prev = now
             gen_v = D.reduce_mean(last_gen_loss, distributed)
             crit_v = D.reduce_mean(last_crit_loss, distributed)
+            dmd_grad_v = D.reduce_mean(last_dmd_grad_norm, distributed)
             log(f"[train] step {step}/{args.max_iters} | gen_loss {gen_v:.4f} "
                 f"| crit_loss {crit_v:.4f} | grad_norm {last_grad_norm:.3f} "
+                f"| dmd_grad {dmd_grad_v:.4f} "
                 f"| {dt:.2f}s/{args.log_every}it")
             if is_main:
                 append_jsonl(metrics_path, {
@@ -466,6 +558,7 @@ def main():
                     "gen_loss": gen_v,
                     "crit_loss": crit_v,
                     "grad_norm": last_grad_norm,
+                    "dmdtrain_gradient_norm": dmd_grad_v,
                     "lr": cfg.lr,
                     "lr_critic": getattr(cfg, "lr_critic", cfg.lr),
                     "sec_per_window": dt,
@@ -474,6 +567,11 @@ def main():
                 writer.add_scalar("train/gen_loss", gen_v, step)
                 writer.add_scalar("train/crit_loss", crit_v, step)
                 writer.add_scalar("train/grad_norm", last_grad_norm, step)
+                writer.add_scalar(
+                    "train/dmdtrain_gradient_norm",
+                    dmd_grad_v,
+                    step,
+                )
                 writer.add_scalar("train/sec_per_window", dt, step)
 
         if step % args.save_every == 0:
@@ -497,34 +595,7 @@ def main():
             D.barrier()
 
         if sample_every and step % sample_every == 0:
-            sample_mses = {}
-            for kind, _idx, eb in eval_specs:
-                try:
-                    out = os.path.join(sample_dir, f"step_{step:06d}_{kind}.mp4")
-                    mse = save_sample(
-                        model, eb, build_cond, sample_scheduler,
-                        device, dtype, out, is_main,
-                        sample_steps=args.sample_steps,
-                        sample_seed=int(getattr(cfg, "seed", 0)) + int(_idx),
-                    )
-                    if is_main:
-                        if mse is not None:
-                            sample_mses[kind] = mse
-                        log(f"[train] wrote sample {out}"
-                            + (f" | mse {mse:.4f}" if mse is not None else ""))
-                except Exception as e:  # sampling must never kill training
-                    log(f"[train] sample '{kind}' failed at step {step}: {e}")
-            if is_main and sample_mses:
-                mean_mse = sum(sample_mses.values()) / len(sample_mses)
-                rec = {"step": step, "sample_mse_mean": mean_mse,
-                       "time": datetime.now().isoformat()}
-                for k, v in sample_mses.items():
-                    rec[f"sample_mse_{k}"] = v
-                    writer.add_scalar(f"sample/mse_{k}", v, step)
-                writer.add_scalar("sample/mse_mean", mean_mse, step)
-                append_jsonl(sample_metrics_path, rec)
-                log("[train] sample mse mean {:.4f} (".format(mean_mse)
-                    + ", ".join(f"{k}={v:.4f}" for k, v in sample_mses.items()) + ")")
+            write_progress_samples(step)
 
     log("[train] done")
     if writer is not None:

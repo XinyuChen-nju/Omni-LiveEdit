@@ -37,6 +37,8 @@ class BerniniEditTeacher(nn.Module):
         model_name: str = "Bernini-R-1.3B",
         model_path: Optional[str] = None,
         timestep_shift: float = 5.0,
+        num_frame_per_block: int = 1,
+        causal_source: bool = False,
         guidance_mode: str = "v2v_apg",
         omega_v: float = 1.25,
         omega_i: float = 4.5,
@@ -47,8 +49,12 @@ class BerniniEditTeacher(nn.Module):
         super().__init__()
         # Bidirectional edit backbone, frozen.
         self.model = build_causal_edit_model(
-            model_name, num_frame_per_block=1, model_path=model_path)
+            model_name,
+            num_frame_per_block=num_frame_per_block,
+            model_path=model_path,
+        )
         self.model.bidirectional = True
+        self.model.causal_source = causal_source
         self.model.eval().requires_grad_(False)
 
         self.guidance_mode = guidance_mode
@@ -76,6 +82,7 @@ class BerniniEditTeacher(nn.Module):
         text_uncond: List[torch.Tensor],
         source_latents: Optional[List[torch.Tensor]] = None,  # each [B, F, C, H, W]
         ref_latents: Optional[List[torch.Tensor]] = None,     # each [B, 1, C, H, W]
+        source_timesteps: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Return the guided x0 prediction (pred_real), shape [B, F, C, H, W]."""
         b, f = noisy_image_or_video.shape[:2]
@@ -86,13 +93,20 @@ class BerniniEditTeacher(nn.Module):
 
         # Build condition token sets with incrementing source_id (matches Bernini).
         vids, refs = source_latents or [], ref_latents or []
+        src_ts = source_timesteps or [None] * len(vids)
+        if len(src_ts) != len(vids):
+            raise ValueError(
+                "source_timesteps must have one entry per source latent"
+            )
         sid = 1
         v_cond, vi_cond = [], []
-        for v in vids:
-            spec = (to_bcfhw(v), sid, True); sid += 1   # source video stream (block-causal)
+        for v, src_t in zip(vids, src_ts):
+            spec = (to_bcfhw(v), sid, True, src_t)
+            sid += 1
             v_cond.append(spec); vi_cond.append(spec)
         for r in refs:
-            spec = (to_bcfhw(r), sid, False); sid += 1  # reference image (global prefix)
+            spec = (to_bcfhw(r), sid, False, None)
+            sid += 1
             vi_cond.append(spec)
 
         mode = self.guidance_mode
