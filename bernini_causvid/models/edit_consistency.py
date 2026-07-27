@@ -81,6 +81,12 @@ class EditNaiveConsistency(nn.Module):
 
         self.guidance_scale = getattr(config, "guidance_scale", 3.0)
         self.teacher_forcing = getattr(config, "teacher_forcing", True)
+        self.source_timestep_mode = str(
+            getattr(config, "source_timestep_mode", "source")
+        ).lower()
+        if self.source_timestep_mode not in ("source", "target"):
+            raise ValueError(
+                "source_timestep_mode must be 'source' or 'target'")
         self.discrete_cd_N = getattr(config, "discrete_cd_N", 48)
         self.scheduler = FlowMatchScheduler(shift=tshift, sigma_min=0.0, extra_one_step=True)
         self.scheduler.set_timesteps(num_inference_steps=self.discrete_cd_N, denoising_strength=1.0)
@@ -91,6 +97,46 @@ class EditNaiveConsistency(nn.Module):
     def update_ema(self, decay: float):
         for p_ema, p in zip(self.generator_ema.parameters(), self.generator.parameters()):
             p_ema.mul_(decay).add_(p.detach(), alpha=1.0 - decay)
+
+    def _condition_at_t(self, conditional_dict, timestep):
+        """Attach source time embeddings for one CD model evaluation.
+
+        Source latents stay clean throughout CD. In ``source`` mode their
+        embedding is therefore timestep zero. In ``target`` mode each model
+        evaluation uses its own target timestep (t for teacher/student and
+        t_next for the EMA consistency target).
+        """
+        cond = dict(conditional_dict)
+        sources = conditional_dict.get("source_latents")
+        if sources is None:
+            cond.pop("source_timesteps", None)
+            return cond
+        if not isinstance(sources, (list, tuple)):
+            sources = [sources]
+
+        source_timesteps = []
+        for source in sources:
+            b, f = source.shape[:2]
+            if self.source_timestep_mode == "source":
+                source_t = torch.zeros(
+                    (b, f), device=source.device, dtype=source.dtype)
+            else:
+                source_t = timestep.to(
+                    device=source.device, dtype=source.dtype)
+                if source_t.dim() == 1:
+                    source_t = source_t.view(b, 1)
+                if source_t.shape[0] != b:
+                    raise ValueError(
+                        f"target timestep batch {source_t.shape[0]} != source batch {b}")
+                if source_t.shape[1] == 1 and f > 1:
+                    source_t = source_t.expand(b, f)
+                if tuple(source_t.shape) != (b, f):
+                    raise ValueError(
+                        f"target timestep shape {tuple(source_t.shape)} "
+                        f"does not match source frames {(b, f)}")
+            source_timesteps.append(source_t)
+        cond["source_timesteps"] = source_timesteps
+        return cond
 
     def _cond_arg(self, clean):
         return clean if self.teacher_forcing else None
@@ -114,18 +160,24 @@ class EditNaiveConsistency(nn.Module):
             clean, noise=noise, timestep=t * torch.ones([1], device=self.device)
         ).to(self.dtype)
 
+        conditional_t = self._condition_at_t(conditional_dict, timestep)
+        unconditional_t = self._condition_at_t(
+            unconditional_dict, timestep)
+        conditional_t_next = self._condition_at_t(
+            conditional_dict, timestep_next)
+
         # one teacher CFG step from t -> t_next.
         with torch.no_grad():
-            v_cond, _ = self.teacher(latent_t, conditional_dict, timestep, clean_x=self._cond_arg(clean))
-            v_uncond, _ = self.teacher(latent_t, unconditional_dict, timestep, clean_x=self._cond_arg(clean))
+            v_cond, _ = self.teacher(latent_t, conditional_t, timestep, clean_x=self._cond_arg(clean))
+            v_uncond, _ = self.teacher(latent_t, unconditional_t, timestep, clean_x=self._cond_arg(clean))
             v_pred = v_uncond + self.guidance_scale * (v_cond - v_uncond)
             dt = ((timestep - timestep_next) / 1000.0).reshape(b, f, 1, 1, 1)
             latent_t_next = latent_t - dt * v_pred
 
-        _, cm_pred_t = self.generator(latent_t, conditional_dict, timestep, clean_x=self._cond_arg(clean))
+        _, cm_pred_t = self.generator(latent_t, conditional_t, timestep, clean_x=self._cond_arg(clean))
         with torch.no_grad():
             _, cm_pred_t_next = self.generator_ema(
-                latent_t_next, conditional_dict, timestep_next, clean_x=self._cond_arg(clean))
+                latent_t_next, conditional_t_next, timestep_next, clean_x=self._cond_arg(clean))
 
         loss = F.mse_loss(cm_pred_t, cm_pred_t_next.detach(), reduction="mean")
         log_dict = {"t": float(t), "t_next": float(t_next)}

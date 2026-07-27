@@ -334,20 +334,9 @@ def main():
                     u = model.text_encoder(text_prompts=[neg_prompt])
                 uncond_cache = {"prompt_embeds": u["prompt_embeds"][:1].detach()}
         source_latents = [batch["source_latent"].to(device, dtype)]
-
-        # CD 阶段使用干净 source，因此 source 的实际噪声 timestep
-        # 和模型 time embedding 都固定为 0。
-        source_timesteps = [
-            torch.zeros(
-                (src.shape[0], src.shape[1]),
-                device=device,
-                dtype=dtype,
-            )
-            for src in source_latents
-        ]
-
+        # Source stays clean in CD. EditNaiveConsistency attaches either zero
+        # or the current target timestep before each teacher/student/EMA call.
         cond["source_latents"] = source_latents
-        cond["source_timesteps"] = source_timesteps
 
         if "ref_latents" in batch:
             cond["ref_latents"] = [
@@ -358,7 +347,6 @@ def main():
             "prompt_embeds": uncond_cache["prompt_embeds"].expand(b, -1, -1)
         }
         uncond["source_latents"] = source_latents
-        uncond["source_timesteps"] = source_timesteps
 
         if "ref_latents" in cond:
             uncond["ref_latents"] = cond["ref_latents"]
