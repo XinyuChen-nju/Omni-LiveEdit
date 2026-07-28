@@ -69,16 +69,57 @@ def test_bidirectional_mask():
 def test_bidirectional_full_source_mask():
     fs, nfpb, nfr = 2, 1, 3
     cond_len = nfr * fs + fs
-    # src_mask_len=0 is the model's causal_source=False path: every condition
-    # token is a globally visible prefix for both real and fake score networks.
+    # src_mask_len=0 + bidirectional=True is the causal_source=False score path.
+    # It must bypass flex masking entirely and use original Bernini-style full
+    # self-attention over [source | refs | target].
     m = M._prepare_edit_attn_mask(
         "cpu", cond_len, 0, nfr, fs, nfpb,
         local_attn_size=-1, bidirectional=True,
     )
-    all_cond = set(range(cond_len))
-    all_tgt = set(range(cond_len, cond_len + nfr * fs))
-    assert _rows(m, cond_len) & (all_cond | all_tgt) == all_cond | all_tgt
-    print("[ok] bidirectional score mask: full source + full target visibility")
+    assert m is None
+    print("[ok] bidirectional score path: unmasked Bernini full attention")
+
+
+def test_unmasked_bidirectional_dispatches_flash_attention():
+    class FakeAttention:
+        num_heads = 1
+        head_dim = 4
+        q = torch.nn.Identity()
+        k = torch.nn.Identity()
+        v = torch.nn.Identity()
+        o = torch.nn.Identity()
+        norm_q = torch.nn.Identity()
+        norm_k = torch.nn.Identity()
+
+    x = torch.randn(1, 2, 4)
+    region_specs = [(2, 2, 1, 1, 0)]
+    base_freqs = torch.ones(1024, 2, dtype=torch.complex128)
+    vid_table = torch.ones(1, 2, dtype=torch.complex128)
+    called = {}
+
+    original_flash_attention = cem.flash_attention
+
+    def fake_flash_attention(q, k, v, **kwargs):
+        called["shapes"] = (q.shape, k.shape, v.shape)
+        called["kwargs"] = kwargs
+        return q
+
+    cem.flash_attention = fake_flash_attention
+    try:
+        out = cem.CausalEditSelfAttention.forward_edit(
+            FakeAttention(), x, region_specs, base_freqs, vid_table, None
+        )
+    finally:
+        cem.flash_attention = original_flash_attention
+
+    assert called["shapes"] == (
+        torch.Size([1, 2, 1, 4]),
+        torch.Size([1, 2, 1, 4]),
+        torch.Size([1, 2, 1, 4]),
+    )
+    assert called["kwargs"] == {}
+    assert out.shape == x.shape
+    print("[ok] unmasked score attention dispatches full flash attention")
 
 
 def test_tf_mask():
@@ -102,5 +143,6 @@ if __name__ == "__main__":
     test_causal_mask()
     test_bidirectional_mask()
     test_bidirectional_full_source_mask()
+    test_unmasked_bidirectional_dispatches_flash_attention()
     test_tf_mask()
     print("ALL PASS")

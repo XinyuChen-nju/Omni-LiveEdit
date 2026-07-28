@@ -22,8 +22,9 @@ dense training mask matches the block-by-block streaming inference exactly.
                       i.e. a target frame at block i can ONLY attend to source
                       frames at block <= i (no future source leakage), which is
                       what real-time streaming editing requires.
-                    - bidirectional=True (frozen DMD teacher/critic) makes
-                      target<->target full while source stays block-aligned.
+                    - bidirectional=True + causal_source=False (the default DMD
+                      teacher/critic path) uses unmasked Bernini-style full
+                      attention over source, refs and target.
     output       :  only the (noisy) target tokens are decoded by the head.
 
 `source_id` RoPE replicates Bernini exactly: a per-stream complex multiplier
@@ -60,7 +61,7 @@ except Exception:  # pragma: no cover - 仅作为保险，缺失则维持默认
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
 
 from wan.modules.model import sinusoidal_embedding_1d
-from wan.modules.attention import attention as varlen_attention
+from wan.modules.attention import attention as varlen_attention, flash_attention
 from wan.modules.causal_model import (
     CausalWanModel,
     CausalWanSelfAttention,
@@ -181,11 +182,12 @@ class EditKVCache:
 
 
 class CausalEditSelfAttention(CausalWanSelfAttention):
-    """Dense edit self-attention: pre-roped q/k regions + an explicit edit mask.
+    """Dense edit self-attention with per-region RoPE.
 
     `q_rope` / `k_rope` are already rotary-applied (per-region source_id RoPE is
-    handled by the model), so this only does the projection, normalization and
-    flex-attention with the edit block mask.
+    handled by the model). Causal edit paths use flex-attention with an explicit
+    block mask. Fully bidirectional score paths pass ``block_mask=None`` and use
+    the same unmasked flash-attention kernel as the original Wan/Bernini model.
     """
 
     def forward_edit(self, x, region_specs, base_freqs, vid_table, block_mask):
@@ -204,6 +206,14 @@ class CausalEditSelfAttention(CausalWanSelfAttention):
             off += length
         roped_q = torch.cat(roped_q, dim=1)
         roped_k = torch.cat(roped_k, dim=1)
+
+        # Original bidirectional Bernini packs all visual regions into one sequence
+        # and applies ordinary full self-attention, without an edit mask. Keep the
+        # source-id RoPE above, but otherwise use the original unmasked attention
+        # kernel so source/ref/target queries can all attend to one another.
+        if block_mask is None:
+            out = flash_attention(q=roped_q, k=roped_k, v=v)
+            return self.o(out.flatten(2))
 
         padded_length = math.ceil(s / 128) * 128 - s
         if padded_length > 0:
@@ -351,13 +361,17 @@ class CausalEditWanModel(CausalWanModel):
           * refs           : visible to every query (global condition).
           * source         : block-causal among itself (source block i sees <= i).
           * target block i : refs + source blocks <= i + target blocks <= i
-                             (block-causal); bidirectional==True makes target<->target
-                             full (the frozen DMD teacher / critic), source stays
-                             block-aligned.
+                             (block-causal); bidirectional=True keeps target full
+                             while source stays block-aligned only when src_len>0
+                             (`causal_source=True`).
 
-        `src_len == 0` (no source, or causal_source disabled) reproduces a fully
-        visible condition prefix.
+        `src_len == 0` together with `bidirectional=True` is the DMD score path:
+        return ``None`` to select original Bernini-style unmasked full attention
+        over the packed [source | refs | target] sequence.
         """
+        if bidirectional and src_len == 0:
+            return None
+
         noisy_len = noisy_num_frames * frame_seqlen
         total = cond_len + noisy_len
         padded = math.ceil(total / 128) * 128 - total
