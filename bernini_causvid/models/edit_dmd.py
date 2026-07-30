@@ -40,6 +40,12 @@ class EditDMD(nn.Module):
 
         model_name = getattr(config, "model_name", "Bernini-R-1.3B")
         model_path = getattr(config, "model_path", None)
+        teacher_model_name = getattr(
+            config, "teacher_model_name", model_name)
+        teacher_model_path = getattr(
+            config, "teacher_model_path", model_path)
+        teacher_model_path_low = getattr(
+            config, "teacher_model_path_low", None)
         text_encoder_path = getattr(config, "text_encoder_path", None)
         tokenizer_path = getattr(config, "tokenizer_path", None)
         vae_path = getattr(config, "vae_path", None)
@@ -70,7 +76,22 @@ class EditDMD(nn.Module):
         self.fake_score.model.causal_source = score_causal_source
 
         self.real_score = BerniniEditTeacher(
-            model_name=model_name, model_path=model_path, timestep_shift=tshift,
+            model_name=teacher_model_name,
+            model_path=teacher_model_path,
+            model_path_low=teacher_model_path_low,
+            switch_boundary=getattr(
+                config, "teacher_switch_boundary", 875.0),
+            omega_scale=getattr(config, "teacher_omega_scale", 0.75),
+            load_dtype=(
+                self.dtype
+                if getattr(
+                    config,
+                    "teacher_load_in_mixed_precision",
+                    teacher_model_path_low is not None,
+                )
+                else None
+            ),
+            timestep_shift=tshift,
             num_frame_per_block=nfpb,
             causal_source=score_causal_source,
             guidance_mode=getattr(config, "guidance_mode", "v2v_apg"),
@@ -175,8 +196,14 @@ class EditDMD(nn.Module):
                 (1 + (self.timestep_shift - 1) * (timestep / 1000)) * 1000
         return timestep.clamp(self.min_step, self.max_step)
 
-    def _sample_timestep(self, b, f, lo, hi):
-        ts = torch.randint(int(lo), int(hi), (b, 1), device=self.device, dtype=torch.long).repeat(1, f)
+    def _sample_timestep(self, b, f, lo, hi, synchronize=False):
+        sample_b = 1 if synchronize else b
+        ts = torch.randint(
+            int(lo), int(hi), (sample_b, 1),
+            device=self.device, dtype=torch.long)
+        if synchronize and torch.distributed.is_initialized():
+            torch.distributed.broadcast(ts, src=0)
+        ts = ts.repeat(b if synchronize else 1, f)
         return self._shift_ts(ts)
 
     def _split_cond(self, conditional_dict):
@@ -250,7 +277,10 @@ class EditDMD(nn.Module):
         with torch.no_grad():
             lo = t_to if self.ts_schedule and t_to is not None else self.min_score_timestep
             hi = self.num_train_timestep
-            timestep = self._sample_timestep(b, f, lo, hi)
+            timestep = self._sample_timestep(
+                b, f, lo, hi,
+                synchronize=self.real_score.is_dual_expert,
+            )
             noise = torch.randn_like(pred_image)
             noisy = self.scheduler.add_noise(
                 pred_image.flatten(0, 1), noise.flatten(0, 1), timestep.flatten(0, 1)

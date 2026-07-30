@@ -23,6 +23,7 @@ way the returned quantity is the x0 prediction DMD consumes as `pred_real`.
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from utils.scheduler import FlowMatchScheduler
@@ -36,6 +37,10 @@ class BerniniEditTeacher(nn.Module):
         self,
         model_name: str = "Bernini-R-1.3B",
         model_path: Optional[str] = None,
+        model_path_low: Optional[str] = None,
+        switch_boundary: float = 875.0,
+        omega_scale: float = 0.75,
+        load_dtype: Optional[torch.dtype] = None,
         timestep_shift: float = 5.0,
         num_frame_per_block: int = 1,
         causal_source: bool = False,
@@ -47,15 +52,36 @@ class BerniniEditTeacher(nn.Module):
         apg_norm_threshold: float = 50.0,
     ):
         super().__init__()
-        # Bidirectional edit backbone, frozen.
+        # Bidirectional edit backbone, frozen. Bernini 14B supplies a second
+        # low-noise expert; 1.3B remains the backward-compatible single model.
         self.model = build_causal_edit_model(
             model_name,
             num_frame_per_block=num_frame_per_block,
             model_path=model_path,
+            torch_dtype=load_dtype,
         )
         self.model.bidirectional = True
         self.model.causal_source = causal_source
         self.model.eval().requires_grad_(False)
+        self.model_low = None
+        if model_path_low:
+            self.model_low = build_causal_edit_model(
+                model_name,
+                num_frame_per_block=num_frame_per_block,
+                model_path=model_path_low,
+                torch_dtype=load_dtype,
+            )
+            self.model_low.bidirectional = True
+            self.model_low.causal_source = causal_source
+            self.model_low.eval().requires_grad_(False)
+
+        self.is_dual_expert = self.model_low is not None
+        self.switch_timestep = (
+            float(switch_boundary) * 1000.0
+            if float(switch_boundary) <= 1.0
+            else float(switch_boundary)
+        )
+        self.omega_scale = float(omega_scale)
 
         self.guidance_mode = guidance_mode
         self.omega_v = omega_v
@@ -67,11 +93,35 @@ class BerniniEditTeacher(nn.Module):
         self.scheduler = FlowMatchScheduler(shift=timestep_shift, sigma_min=0.0, extra_one_step=True)
         self.scheduler.set_timesteps(1000, training=True)
 
+    def _uses_low_expert(self, timestep: torch.Tensor) -> bool:
+        if not self.is_dual_expert:
+            return False
+        low = timestep < self.switch_timestep
+        local_min = low.to(torch.int32).min()
+        local_max = low.to(torch.int32).max()
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(local_min, op=dist.ReduceOp.MIN)
+            dist.all_reduce(local_max, op=dist.ReduceOp.MAX)
+        if int(local_min.item()) != int(local_max.item()):
+            raise ValueError(
+                "A Bernini dual-expert teacher requires one expert per DMD "
+                "score batch; synchronize the sampled timestep across ranks.")
+        return bool(local_min.item())
+
+    def _guidance_multiplier(self, timestep: torch.Tensor) -> float:
+        return self.omega_scale if self._uses_low_expert(timestep) else 1.0
+
     # ---- one bidirectional edit forward (returns flow/velocity pred) ------
-    def _flow(self, noisy_bcfhw, t_flat, context, cond_latents):
+    def _flow(self, noisy_bcfhw, t_flat, context, cond_latents, use_low=None):
         # noisy_bcfhw: [B, C, F, H, W]; t_flat: [B, F]; returns flow [B, C, F, H, W]
-        return self.model.forward_edit(
-            x=noisy_bcfhw, t=t_flat, context=context, cond_latents=cond_latents)
+        if use_low is None:
+            use_low = self._uses_low_expert(t_flat)
+        model = self.model_low if use_low else self.model
+        # Enter through Module.__call__. When an expert is FSDP-wrapped this
+        # triggers its all-gather and mixed-precision hooks before forward_edit.
+        return model(
+            x=noisy_bcfhw, t=t_flat, context=context,
+            cond_latents=cond_latents, edit_mode=True)
 
     @torch.no_grad()
     def predict_real(
@@ -110,36 +160,48 @@ class BerniniEditTeacher(nn.Module):
             vi_cond.append(spec)
 
         mode = self.guidance_mode
+        use_low = self._uses_low_expert(timestep)
+        scale_mult = self.omega_scale if use_low else 1.0
+        omega_v = self.omega_v * scale_mult
+        omega_i = self.omega_i * scale_mult
+        omega_ti = self.omega_ti * scale_mult
         if mode == "v2v_apg":
             # Adaptive Projected Guidance, evaluated in x0 space (Bernini's
             # `v2v_apg`). Non-linear, so it cannot be folded into the flow-space
             # combination used by the other modes; return the guided x0 directly.
-            v_uncond = self._flow(x, timestep, text_uncond, vi_cond).permute(0, 2, 1, 3, 4)
-            v_cond = self._flow(x, timestep, text_cond, vi_cond).permute(0, 2, 1, 3, 4)
+            v_uncond = self._flow(
+                x, timestep, text_uncond, vi_cond, use_low).permute(0, 2, 1, 3, 4)
+            v_cond = self._flow(
+                x, timestep, text_cond, vi_cond, use_low).permute(0, 2, 1, 3, 4)
             x0_uncond = self._convert_flow_pred_to_x0(
                 v_uncond.flatten(0, 1), noisy_image_or_video.flatten(0, 1),
                 timestep.flatten(0, 1)).unflatten(0, (b, f))
             x0_cond = self._convert_flow_pred_to_x0(
                 v_cond.flatten(0, 1), noisy_image_or_video.flatten(0, 1),
                 timestep.flatten(0, 1)).unflatten(0, (b, f))
-            return self._apg(x0_cond, x0_uncond, self.omega_ti)
+            return self._apg(x0_cond, x0_uncond, omega_ti)
         elif mode in ("v2v", "i2i"):
-            eps_vi = self._flow(x, timestep, text_uncond, vi_cond)
-            eps_vti = self._flow(x, timestep, text_cond, vi_cond)
-            flow = eps_vi + self.omega_ti * (eps_vti - eps_vi)
+            eps_vi = self._flow(
+                x, timestep, text_uncond, vi_cond, use_low)
+            eps_vti = self._flow(
+                x, timestep, text_cond, vi_cond, use_low)
+            flow = eps_vi + omega_ti * (eps_vti - eps_vi)
         elif mode == "rv2v":
-            eps_0 = self._flow(x, timestep, text_uncond, [])
-            eps_v = self._flow(x, timestep, text_uncond, v_cond)
-            eps_vi = self._flow(x, timestep, text_uncond, vi_cond)
-            eps_vti = self._flow(x, timestep, text_cond, vi_cond)
+            eps_0 = self._flow(x, timestep, text_uncond, [], use_low)
+            eps_v = self._flow(
+                x, timestep, text_uncond, v_cond, use_low)
+            eps_vi = self._flow(
+                x, timestep, text_uncond, vi_cond, use_low)
+            eps_vti = self._flow(
+                x, timestep, text_cond, vi_cond, use_low)
             flow = (eps_0
-                    + self.omega_v * (eps_v - eps_0)
-                    + self.omega_i * (eps_vi - eps_v)
-                    + self.omega_ti * (eps_vti - eps_vi))
+                    + omega_v * (eps_v - eps_0)
+                    + omega_i * (eps_vi - eps_v)
+                    + omega_ti * (eps_vti - eps_vi))
         elif mode == "t2v":
-            eps_0 = self._flow(x, timestep, text_uncond, [])
-            eps_t = self._flow(x, timestep, text_cond, [])
-            flow = eps_0 + self.omega_ti * (eps_t - eps_0)
+            eps_0 = self._flow(x, timestep, text_uncond, [], use_low)
+            eps_t = self._flow(x, timestep, text_cond, [], use_low)
+            flow = eps_0 + omega_ti * (eps_t - eps_0)
         else:
             raise ValueError(f"unknown guidance_mode {mode}")
 

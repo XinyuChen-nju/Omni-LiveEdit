@@ -274,9 +274,35 @@ def main():
             model.generator.float(), sharding, cfg.mixed_precision)
         model.fake_score = D.fsdp_wrap_single(
             model.fake_score.float(), sharding, cfg.mixed_precision)
-        # real_score (BerniniEditTeacher) is entered via `predict_real`, not
-        # `__call__`, so FSDP hooks would never fire -> keep it replicated bf16.
-        model.real_score = model.real_score.to(device).to(dtype)
+        if model.real_score.is_dual_expert:
+            # Bernini 14B has independent high/low-noise experts. Wrap each as
+            # its own frozen FSDP unit; `_flow` enters through Module.__call__.
+            teacher_sharding = getattr(
+                cfg, "teacher_sharding_strategy", sharding)
+            teacher_cpu_offload = bool(
+                getattr(cfg, "teacher_cpu_offload", False))
+            model.real_score.model = D.fsdp_wrap_single(
+                model.real_score.model.to(dtype),
+                teacher_sharding,
+                cfg.mixed_precision,
+                cpu_offload=teacher_cpu_offload,
+            )
+            model.real_score.model_low = D.fsdp_wrap_single(
+                model.real_score.model_low.to(dtype),
+                teacher_sharding,
+                cfg.mixed_precision,
+                cpu_offload=teacher_cpu_offload,
+            )
+            log(
+                "[train] real_score uses Bernini 14B dual experts "
+                f"(switch={model.real_score.switch_timestep:g}, "
+                f"omega_scale={model.real_score.omega_scale:g}, "
+                f"sharding={teacher_sharding}, "
+                f"cpu_offload={teacher_cpu_offload})"
+            )
+        else:
+            # The 1.3B teacher is small enough to replicate on every rank.
+            model.real_score = model.real_score.to(device).to(dtype)
         if model.text_encoder is not None:
             model.text_encoder = D.fsdp_wrap_single(
                 model.text_encoder, sharding, cfg.mixed_precision)
@@ -288,6 +314,10 @@ def main():
     else:
         model.generator = model.generator.to(device).to(dtype)
         model.fake_score = model.fake_score.to(device).to(dtype)
+        if model.real_score.is_dual_expert:
+            raise RuntimeError(
+                "Bernini 14B dual-expert real_score requires torchrun/FSDP; "
+                "launch Stage 3 with NPROC_PER_NODE > 1.")
         model.real_score = model.real_score.to(device).to(dtype)
         if model.text_encoder is not None:
             model.text_encoder = model.text_encoder.to(device)
@@ -321,7 +351,7 @@ def main():
     if ema_weight > 0.0 and step >= ema_start_step:
         ema = D.make_ema(model.generator, ema_weight, distributed)
         if resume_ema_sd is not None:
-            D.load_ema(ema, resume_ema_sd, distributed)
+            D.load_ema(ema, resume_ema_sd, model.generator, distributed)
 
     neg_prompt = cfg.negative_prompt
     uncond_cache = None

@@ -98,48 +98,81 @@ class EMA_FSDP:
         self.shadow = {}
         self._init_shadow(fsdp_module)
 
+    @staticmethod
+    def _local_param_shards(fsdp_module):
+        """Yield canonical local shards, independent of FSDP's current views."""
+        flat_param = fsdp_module._handle.flat_param
+        local_shard = flat_param._local_shard
+        for fqn, info in zip(flat_param._fqns, flat_param._shard_param_infos):
+            if info.in_shard:
+                start = info.offset_in_shard
+                end = start + info.numel_in_shard
+                yield fqn, local_shard[start:end], info
+            else:
+                yield fqn, local_shard.new_empty(0), info
+
     @torch.no_grad()
     def _init_shadow(self, fsdp_module):
-        for n, p in fsdp_module.module.named_parameters():
-            self.shadow[n] = p.detach().clone().float().cpu()
+        self.shadow = {
+            n: shard.detach().clone().float().cpu()
+            for n, shard, _ in self._local_param_shards(fsdp_module)
+        }
 
     @torch.no_grad()
     def update(self, fsdp_module):
         d = self.decay
-        for n, p in fsdp_module.module.named_parameters():
-            self.shadow[n].mul_(d).add_(p.detach().float().cpu(), alpha=1. - d)
+        for n, shard, _ in self._local_param_shards(fsdp_module):
+            self.shadow[n].mul_(d).add_(
+                shard.detach().float().cpu(), alpha=1. - d)
 
     # Optional helpers ---------------------------------------------------
     def state_dict(self):
         return self.shadow            # picklable
 
-    def load_state_dict(self, sd):
-        self.shadow = {k: v.clone() for k, v in sd.items()}
+    @torch.no_grad()
+    def load_full_state_dict(self, fsdp_module, sd):
+        """Restore rank-local EMA shards from a consolidated checkpoint."""
+        shadow = {}
+        for fqn, local_shard, info in self._local_param_shards(fsdp_module):
+            key = fqn
+            if key not in sd and key.startswith("model._fsdp_wrapped_module."):
+                key = key.replace("model._fsdp_wrapped_module.", "model.", 1)
+            if key not in sd:
+                raise KeyError(f"EMA checkpoint is missing parameter: {fqn}")
+            if info.in_shard:
+                start = info.intra_param_start_idx
+                end = info.intra_param_end_idx + 1
+                value = sd[key].detach().reshape(-1)[start:end]
+                if value.numel() != local_shard.numel():
+                    raise RuntimeError(
+                        f"EMA shard size mismatch for {fqn}: "
+                        f"checkpoint={value.numel()} local={local_shard.numel()}")
+                shadow[fqn] = value.clone().float().cpu()
+            else:
+                shadow[fqn] = torch.empty(0, dtype=torch.float32)
+        self.shadow = shadow
 
+    @torch.no_grad()
     def copy_to(self, fsdp_module):
-        for n, p in fsdp_module.module.named_parameters():
+        for n, shard, _ in self._local_param_shards(fsdp_module):
             if n in self.shadow:
-                p.data.copy_(self.shadow[n].to(dtype=p.dtype, device=p.device))
+                shard.copy_(self.shadow[n].to(
+                    dtype=shard.dtype, device=shard.device))
 
     @torch.no_grad()
     def full_state_dict(self, fsdp_module):
-        live_state = {}
-        for n, p in fsdp_module.module.named_parameters():
-            live_state[n] = p.detach().clone()
-        for n, p in fsdp_module.module.named_parameters():
-            if n in self.shadow:
-                p.data.copy_(self.shadow[n].to(dtype=p.dtype, device=p.device))
-
-        checkpoint = fsdp_state_dict(fsdp_module)
-        shadow_checkpoint = {}
-        for n in self.shadow:
-            k = n
-            if k not in checkpoint and k.startswith("model._fsdp_wrapped_module."):
-                k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
-            if k in checkpoint:
-                shadow_checkpoint[n] = checkpoint[k]
-        for n, p in fsdp_module.module.named_parameters():
-            if n in live_state:
-                p.data.copy_(live_state[n].to(dtype=p.dtype, device=p.device))
-
-        return shadow_checkpoint
+        flat_param = fsdp_module._handle.flat_param
+        live_shard = flat_param._local_shard.detach().clone()
+        try:
+            self.copy_to(fsdp_module)
+            checkpoint = fsdp_state_dict(fsdp_module)
+            shadow_checkpoint = {}
+            for n in self.shadow:
+                k = n
+                if k not in checkpoint and k.startswith("model._fsdp_wrapped_module."):
+                    k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
+                if k in checkpoint:
+                    shadow_checkpoint[n] = checkpoint[k]
+            return shadow_checkpoint
+        finally:
+            flat_param._local_shard.copy_(live_shard)

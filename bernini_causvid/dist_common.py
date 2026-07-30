@@ -15,9 +15,9 @@ compute time -> crash. We therefore wrap each model as ONE FSDP unit: its single
 with full params, and reshards afterwards. This still shards parameters, gradients
 and optimizer states (the main memory win), just without per-block gather/reshard.
 
-`BerniniEditTeacher` (the DMD `real_score`) is entered through `predict_real`, also
-not `__call__`, so it is NOT FSDP-wrapped -- it is a frozen, replicated bf16 module
-(~2.6 GB / rank), which is affordable.
+The 1.3B `BerniniEditTeacher` is replicated in bf16 (~2.6 GB/rank). For the 14B
+dual-expert teacher, each frozen expert is wrapped as a separate single FSDP unit;
+its `_flow` enters the expert through `__call__`, so the all-gather hook fires.
 
 Backward compatibility
 -----------------------
@@ -218,10 +218,10 @@ def ema_state_dict(ema, module: torch.nn.Module, distributed: bool) -> dict:
     return ema.state_dict(module)
 
 
-def load_ema(ema, sd: dict, distributed: bool):
+def load_ema(ema, sd: dict, module: torch.nn.Module, distributed: bool):
     """Restore an EMA container from a saved (full) EMA state_dict."""
     if distributed:
-        ema.load_state_dict(sd)            # EMA_FSDP shadow keyed by param name
+        ema.load_full_state_dict(module, sd)
     else:
         ema.load_shadow(sd)                # SimpleEMA
 

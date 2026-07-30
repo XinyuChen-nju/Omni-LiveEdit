@@ -347,6 +347,12 @@ class CausalEditWanModel(CausalWanModel):
     def visual_id_freqs(self):
         return self._visual_id_freqs
 
+    def forward(self, *args, edit_mode: bool = False, **kwargs):
+        """Route edit forwards through ``__call__`` so FSDP hooks can run."""
+        if edit_mode:
+            return self.forward_edit(*args, **kwargs)
+        return super().forward(*args, **kwargs)
+
     # ------------------------------------------------------------------ mask
     @staticmethod
     def _prepare_edit_attn_mask(device, cond_len, src_len, noisy_num_frames,
@@ -730,11 +736,17 @@ class CausalEditWanModel(CausalWanModel):
 
 def build_causal_edit_model(model_name: str, local_attn_size: int = -1,
                             sink_size: int = 0, num_frame_per_block: int = 1,
-                            model_path: Optional[str] = None):
+                            model_path: Optional[str] = None,
+                            torch_dtype: Optional[torch.dtype] = None):
     """Load converted Bernini weights into a CausalWanModel and promote to edit."""
     resolved_model_path = model_path or f"wan_models/{model_name}/"
-    model = CausalWanModel.from_pretrained(
-        resolved_model_path, local_attn_size=local_attn_size, sink_size=sink_size)
+    load_kwargs = {
+        "local_attn_size": local_attn_size,
+        "sink_size": sink_size,
+    }
+    if torch_dtype is not None:
+        load_kwargs["torch_dtype"] = torch_dtype
+    model = CausalWanModel.from_pretrained(resolved_model_path, **load_kwargs)
     model = CausalEditWanModel.from_causal_model(model)
     model.num_frame_per_block = num_frame_per_block
     return model

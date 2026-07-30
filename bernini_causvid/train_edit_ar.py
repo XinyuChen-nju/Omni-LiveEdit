@@ -291,7 +291,7 @@ def main():
     if ema_weight > 0.0 and step >= ema_start_step:
         ema = D.make_ema(model.generator, ema_weight, distributed)
         if resume_ema_sd is not None:
-            D.load_ema(ema, resume_ema_sd, distributed)
+            D.load_ema(ema, resume_ema_sd, model.generator, distributed)
 
     def build_cond(batch):
         # Prefer precomputed prompt embeds (gen_text_embeds.py): skips the per-step
