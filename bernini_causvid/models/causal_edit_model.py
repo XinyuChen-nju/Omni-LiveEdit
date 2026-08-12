@@ -46,6 +46,13 @@ import torch.nn as nn
 import torch.utils.checkpoint
 from torch.nn.attention.flex_attention import create_block_mask
 
+# The framework compiles FlexAttention with dynamic=False, so mixed-resolution
+# training needs one graph per exact sequence shape. The default limit of eight
+# variants falls back to eager dense attention and can allocate hundreds of GiB.
+torch._dynamo.config.cache_size_limit = max(
+    torch._dynamo.config.cache_size_limit, 128
+)
+
 # 编辑模型的 teacher-forcing 序列是 [源 | clean目标 | noisy目标] 三段拼接，长度 ~98k。
 # flex_attention 用 torch.compile/Triton 构造 block-mask 时，inductor 需要的 XBLOCK
 # 会超过默认上限 TRITON_MAX_BLOCK["X"]=2048（报错：increase TRITON_MAX_BLOCK['X']）。

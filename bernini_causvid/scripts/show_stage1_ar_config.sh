@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CF_ROOT="${CF_ROOT:-/opt/dlami/nvme/chenxinyu/project/Causal-Forcing}"
-PY="${PY:-/opt/dlami/nvme/miniconda3/envs/causal-forcing/bin/python}"
+PY="${PY:-/opt/conda/envs/causvid/bin/python}"
 
 SCRIPT="${SCRIPT:-bernini_causvid/scripts/2_stage1_train_ar.sh}"
 CONFIG="${CONFIG:-bernini_causvid/configs/causvid_edit_ar_1.3b_reco_chunk3-2w.yaml}"

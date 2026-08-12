@@ -57,6 +57,36 @@ def select_eval_items(items, kinds):
     return picked
 
 
+def select_configured_eval_items(items, specs):
+    """Select fixed evaluation samples using exact metadata filters."""
+    selected = []
+    for raw_spec in specs:
+        spec = (OmegaConf.to_container(raw_spec, resolve=True)
+                if OmegaConf.is_config(raw_spec) else dict(raw_spec))
+        name = str(spec.pop("name", "")).strip()
+        count = int(spec.pop("count", 1))
+        if not name or count < 1 or not spec:
+            raise ValueError(
+                "each eval_samples entry needs a name, at least one metadata "
+                "filter, and count >= 1")
+        filters = {str(k): str(v).strip().lower() for k, v in spec.items()}
+        matches = []
+        for idx, item in enumerate(items):
+            if all(str(item.get(k, "")).strip().lower() == v
+                   for k, v in filters.items()):
+                matches.append(idx)
+                if len(matches) == count:
+                    break
+        if len(matches) != count:
+            raise ValueError(
+                f"eval_samples '{name}' matched {len(matches)}/{count} items "
+                f"for filters {filters}")
+        for sample_no, idx in enumerate(matches, 1):
+            sample_name = name if count == 1 else f"{name}_{sample_no}"
+            selected.append((sample_name, idx))
+    return selected
+
+
 @torch.no_grad()
 def _decode_latent_to_mp4(model, latent, device, dtype, out_path):
     """把一段干净 latent（源/目标）解码成 mp4，仅供 rank0 写参考视频。"""
@@ -116,17 +146,21 @@ def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_sche
         vae=None,
     )
 
-    source = cond["source_latents"][0]
+    sample_latent = eval_batch.get("source_latent")
+    if sample_latent is None:
+        sample_latent = eval_batch.get("target_latent")
+    if sample_latent is None:
+        raise RuntimeError("sampling needs a source or target latent for output shape")
 
     # 每个评测样本使用固定初始噪声。
     # 显式创建同 seed 的 Generator，避免不同训练 step 和不同 rank
     # 因全局随机状态不同而产生不同初始噪声。
-    noise_generator = torch.Generator(device=source.device)
+    noise_generator = torch.Generator(device=device)
     noise_generator.manual_seed(int(sample_seed))
     noise = torch.randn(
-        source.shape,
-        device=source.device,
-        dtype=source.dtype,
+        sample_latent.shape,
+        device=device,
+        dtype=dtype,
         generator=noise_generator,
     )
 
@@ -280,7 +314,11 @@ def main():
     elif resume_ema_sd is not None or step > 0:
         log("[train] checkpoint has no optimizer state -> optimizer starts fresh")
 
-    dataset = EditLatentDataset(cfg.data_path, load_target=True)
+    dataset = EditLatentDataset(
+        cfg.data_path,
+        load_target=True,
+        dataset_max_lat_frames=getattr(cfg, "dataset_max_lat_frames", None),
+    )
     loader = D.make_loader(dataset, cfg.batch_size, edit_collate, distributed)
     data = cycle(loader)
     log(f"[train] dataset size {len(dataset)} | grad_accum {grad_accum} | global batch "
@@ -306,23 +344,47 @@ def main():
                 "cache_text_embeds is on but this batch has no `prompt_embeds`; "
                 "run bernini_causvid/tools/gen_text_embeds.py to populate the index, "
                 "or set cache_text_embeds: false in the config.")
-        cond["source_latents"] = [batch["source_latent"].to(device, dtype)]
+        if "source_latent" in batch:
+            cond["source_latents"] = [
+                batch["source_latent"].to(device, dtype)
+            ]
         if "ref_latents" in batch:
-            cond["ref_latents"] = [r.to(device, dtype) for r in batch["ref_latents"]]
+            cond["ref_latents"] = [
+                ref.to(device, dtype) for ref in batch["ref_latents"]
+            ]
         return cond
 
     image_or_video_shape = list(cfg.image_or_video_shape)
-    # 固定的评测样本，使各步进度视频可纵向比较；每种编辑类型（增/删/改/风格化）各取一条，
-    # 这样每次采样都能同时检查 add/remove/replace/style 四类的效果。
-    kinds = [k for k, _ in EDIT_KINDS]
-    picked = select_eval_items(dataset.items, kinds)
-    eval_specs = []  # list of (kind, eval_batch)
-    for kind in kinds:
-        for n, idx in enumerate(picked.get(kind, []), 1):
-            name = f"{kind}_{n}"
+    # Universal runs configure one or more fixed examples per task/dataset.  The
+    # legacy ReCo-only configs keep the previous edit-type selector unchanged.
+    configured_eval = getattr(cfg, "eval_samples", None)
+    eval_specs = []  # list of (name, dataset index, collated batch)
+    if configured_eval:
+        selected = select_configured_eval_items(dataset.items, configured_eval)
+        available_tasks = {
+            str(item.get("task_type", "")).strip().lower()
+            for item in dataset.items if item.get("task_type")
+        }
+        covered_tasks = {
+            str(dataset.items[idx].get("task_type", "")).strip().lower()
+            for _name, idx in selected
+        }
+        missing_tasks = sorted(available_tasks - covered_tasks)
+        if missing_tasks:
+            raise ValueError(
+                "eval_samples does not cover dataset task types: "
+                + ", ".join(missing_tasks))
+        for name, idx in selected:
             eval_specs.append((name, idx, edit_collate([dataset[idx]])))
-    if not eval_specs:  # 兜底：数据集没有可识别的编辑类型时，退回首条样本。
-        eval_specs.append(("sample", 0, edit_collate([dataset[0]])))
+    else:
+        kinds = [k for k, _ in EDIT_KINDS]
+        picked = select_eval_items(dataset.items, kinds)
+        for kind in kinds:
+            for n, idx in enumerate(picked.get(kind, []), 1):
+                name = f"{kind}_{n}"
+                eval_specs.append((name, idx, edit_collate([dataset[idx]])))
+        if not eval_specs:
+            eval_specs.append(("sample", 0, edit_collate([dataset[0]])))
 
     # 一次性写出每类样本的源/目标参考视频与元信息，方便对照采样结果。
     if is_main:
@@ -330,12 +392,20 @@ def main():
         for kind, idx, eb in eval_specs:
             meta["samples"][kind] = {
                 "index": idx,
+                "dataset": dataset.items[idx].get("dataset", ""),
+                "task_type": dataset.items[idx].get("task_type", ""),
                 "edit_type": dataset.items[idx].get("edit_type", ""),
                 "prompt": dataset.items[idx].get("prompt", ""),
             }
             try:
-                _decode_latent_to_mp4(model, eb["source_latent"], device, dtype,
-                                      os.path.join(sample_dir, f"_source_{kind}.mp4"))
+                if "source_latent" in eb:
+                    _decode_latent_to_mp4(
+                        model, eb["source_latent"], device, dtype,
+                        os.path.join(sample_dir, f"_source_{kind}.mp4"))
+                for ref_index, ref_latent in enumerate(eb.get("ref_latents", [])):
+                    _decode_latent_to_mp4(
+                        model, ref_latent, device, dtype,
+                        os.path.join(sample_dir, f"_ref{ref_index}_{kind}.mp4"))
                 if "target_latent" in eb:
                     _decode_latent_to_mp4(model, eb["target_latent"], device, dtype,
                                           os.path.join(sample_dir, f"_target_{kind}.mp4"))
@@ -442,8 +512,8 @@ def main():
             D.barrier()
 
         if sample_every and step % sample_every == 0:
-            # 每次采样都跑增/删/改/风格化四类样本，逐个解码写出 step_xxxxxx_<kind>.mp4。
-            # generator 前向是 FSDP collective，所有 rank 必须按同样顺序逐个跑。
+            # Run every configured task/dataset example in a stable order and write
+            # step_xxxxxx_<name>.mp4. FSDP requires every rank to follow this order.
             sample_mses = {}
             for kind, _idx, eb in eval_specs:
                 try:

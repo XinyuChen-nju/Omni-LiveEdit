@@ -3,7 +3,7 @@
 # 从 Causal-Forcing 仓库根目录运行。
 set -e
 CF_ROOT="/apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing"
-PY="/apdcephfs_hzlf/share_1227201/xinyu/conda_setup/miniconda3/envs/causal_forcing/bin/python"
+PY="${PY:-/opt/conda/envs/causvid/bin/python}"
 cd "$CF_ROOT"
 
 CONFIG="${CONFIG:-bernini_causvid/configs/causvid_edit_1.3b.yaml}"  # 推理配置 yaml（需与训练时一致）

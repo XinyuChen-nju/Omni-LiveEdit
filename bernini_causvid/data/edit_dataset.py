@@ -1,149 +1,579 @@
-"""Dataset for editing distillation.
+"""Unified latent dataset for text/video generation and editing.
 
-For the CausVid DMD stage the student is *data-free on the target* (the teacher
-supplies the target distribution), so a sample only needs:
-    - prompt           : the edit instruction text
-    - source_latent    : VAE latent of the source video  [F, C, H, W]
-    - ref_latents      : optional reference-image latents  list of [1, C, H, W]
-    - target_latent    : optional (only for eval / optional regression warmup)
+Canonical sample fields:
 
-Data layout (recommended): a JSON index file whose entries point to pre-encoded
-latent `.pt` files produced by tools/gen_edit_targets.py:
+    {
+      "dataset": "reco",
+      "sample_id": "000001",
+      "prompt": "remove the cup",
+      "task_type": "v2v",              # t2v | s2v | v2v | rv2v
+      "edit_type": "remove",            # preserved for every dataset
+      "source": "optional_source.pt",   # optional for t2v/s2v
+      "refs": ["optional_ref.pt"],      # optional list
+      "target": "required_target.pt",
+      "text_embed": "optional_text.pt"
+    }
 
-    [
-      {"prompt": "...", "task_type": "v2v",
-       "source": "data/edit_lat/0000_src.pt",
-       "refs":   ["data/edit_lat/0000_ref0.pt"],
-       "target": "data/edit_lat/0000_tgt.pt"},
-      ...
-    ]
-
-Each `.pt` is a float tensor of shape [F, C, H, W] (target/source) or [1, C, H, W]
-(reference image).
+The metadata index is one JSON array containing every dataset. Relative tensor
+paths are resolved against that JSON file. Visual-condition structure and tensor
+shapes may differ between tasks, so the provided batch sampler groups compatible
+examples before collation.
 """
+
+from __future__ import annotations
+
 import json
+import math
 import os
-from typing import List
+import random
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any, Iterable, List
 
 import torch
-from torch.utils.data import Dataset
+import torch.nn.functional as F
+from torch.utils.data import Dataset, Sampler
+
+
+TASK_TYPE_ALIASES = {
+    "t2v": "t2v",
+    "text2video": "t2v",
+    "text_to_video": "t2v",
+    "text-to-video": "t2v",
+    "s2v": "s2v",
+    "i2v": "s2v",
+    "image_to_video": "s2v",
+    "image-to-video": "s2v",
+    "subject_to_video": "s2v",
+    "subject-to-video": "s2v",
+    "v2v": "v2v",
+    "video_to_video": "v2v",
+    "video-to-video": "v2v",
+    "video_edit": "v2v",
+    "local_change": "v2v",
+    "global_style": "v2v",
+    "background_change": "v2v",
+    "rv2v": "rv2v",
+    "reference_video_to_video": "rv2v",
+    "reference-video-to-video": "rv2v",
+    "virtual_try_on": "rv2v",
+    "motion_pair": "rv2v",
+}
+
+_PATH_FIELDS = ("source", "target", "text_embed", "ode")
+_SHAPE_FIELDS = (
+    "source_shape",
+    "target_shape",
+    "ref_shapes",
+    "latent_shape",
+    "latent_shape_expected",
+    "spatial_bucket",
+    "encoded_width",
+    "encoded_height",
+)
+_TEMPORAL_SHAPE_FIELDS = {
+    "source_shape",
+    "target_shape",
+    "latent_shape",
+    "latent_shape_expected",
+}
+
+
+def _resolve_path(value: Any, root: Path) -> Any:
+    if value in (None, ""):
+        return value
+    path = Path(os.path.expandvars(os.path.expanduser(str(value))))
+    if not path.is_absolute():
+        path = root / path
+    return str(path.resolve())
+
+
+def _normalise_refs(value: Any) -> list:
+    if value in (None, ""):
+        return []
+    if isinstance(value, (str, os.PathLike)):
+        return [value]
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"`refs` must be a list or path, got {type(value).__name__}")
+    return list(value)
+
+
+def _normalise_task_type(raw: Any, *, has_source: bool, has_refs: bool) -> str:
+    key = str(raw or "").strip().lower().replace(" ", "_")
+    if not key:
+        if has_source:
+            return "v2v"
+        if has_refs:
+            return "s2v"
+        return "t2v"
+    try:
+        return TASK_TYPE_ALIASES[key]
+    except KeyError as exc:
+        allowed = ", ".join(("t2v", "s2v", "v2v", "rv2v"))
+        raise ValueError(f"unsupported task_type {raw!r}; use one of {allowed}") from exc
+
+
+def _normalise_item(
+    raw: dict,
+    *,
+    root: Path,
+    ordinal: int,
+) -> dict:
+    item = dict(raw)
+
+    for field in _PATH_FIELDS:
+        if item.get(field):
+            item[field] = _resolve_path(item[field], root)
+    refs = [_resolve_path(ref, root) for ref in _normalise_refs(item.get("refs"))]
+    item["refs"] = refs
+
+    dataset = str(item.get("dataset") or "").strip()
+    task = _normalise_task_type(
+        item.get("task_type"),
+        has_source=bool(item.get("source")),
+        has_refs=bool(refs),
+    )
+    item["dataset"] = dataset
+    item["task_type"] = task
+    item["prompt"] = str(item.get("prompt") or "")
+    item["sample_id"] = str(
+        item.get("sample_id") or f"{dataset or 'sample'}_{ordinal:08d}"
+    )
+
+    # Every dataset owns this annotation. Empty means not annotated yet; once a
+    # dataset adds it, the value is preserved without dataset-specific filtering.
+    item["edit_type"] = str(item.get("edit_type") or "").strip().lower()
+
+    if task == "s2v" and not refs:
+        raise ValueError(f"{item['sample_id']}: s2v requires at least one `refs` latent")
+    if task == "v2v" and not item.get("source"):
+        raise ValueError(f"{item['sample_id']}: v2v requires a `source` latent")
+    if task == "rv2v":
+        if not item.get("source"):
+            raise ValueError(f"{item['sample_id']}: rv2v requires a `source` latent")
+        if not refs:
+            raise ValueError(f"{item['sample_id']}: rv2v requires at least one `refs` latent")
+    return item
+
+
+def _load_items(index_path: Path) -> list[dict]:
+    with index_path.open(encoding="utf-8") as stream:
+        records = json.load(stream)
+    if not isinstance(records, list):
+        raise ValueError(f"{index_path}: metadata must be one JSON array")
+    if not records:
+        raise ValueError(f"{index_path}: metadata JSON array is empty")
+    if not all(isinstance(item, dict) for item in records):
+        raise ValueError(f"{index_path}: every metadata item must be a JSON object")
+    return [
+        _normalise_item(record, root=index_path.parent, ordinal=index)
+        for index, record in enumerate(records)
+    ]
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return tuple(sorted((str(key), _freeze(val)) for key, val in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(val) for val in value)
+    return value
+
+
+def _pad_latent_spatial(tensor: torch.Tensor, multiple: int = 2) -> torch.Tensor:
+    """Replicate the last row/column so Wan patchification is shape-preserving."""
+    if tensor.ndim < 3:
+        return tensor
+    height, width = tensor.shape[-2:]
+    pad_height = (-height) % multiple
+    pad_width = (-width) % multiple
+    if pad_height or pad_width:
+        tensor = F.pad(
+            tensor,
+            (0, pad_width, 0, pad_height),
+            mode="replicate",
+        )
+    return tensor
+
+
+def _resize_latent_spatial(
+    tensor: torch.Tensor,
+    spatial_size: tuple[int, int],
+) -> torch.Tensor:
+    if tuple(tensor.shape[-2:]) == spatial_size:
+        return tensor
+    if tensor.ndim != 4:
+        raise ValueError(
+            "visual conditions must be [F,C,H,W] before spatial alignment, "
+            f"got {tuple(tensor.shape)}"
+        )
+    return F.interpolate(
+        tensor,
+        size=spatial_size,
+        mode="bilinear",
+        align_corners=False,
+    )
+
+
+def _align_visual_conditions(output: dict) -> None:
+    """Match source/reference spatial shapes to the generated target geometry."""
+    anchor = output.get("target_latent")
+    if anchor is None:
+        anchor = output.get("ode_latent")
+    if anchor is None:
+        anchor = output.get("source_latent")
+    if anchor is None and output.get("ref_latents"):
+        anchor = output["ref_latents"][0]
+    if anchor is None:
+        return
+    spatial_size = tuple(anchor.shape[-2:])
+    if "source_latent" in output:
+        output["source_latent"] = _resize_latent_spatial(
+            output["source_latent"],
+            spatial_size,
+        )
+    if "ref_latents" in output:
+        output["ref_latents"] = [
+            _resize_latent_spatial(reference, spatial_size)
+            for reference in output["ref_latents"]
+        ]
 
 
 class EditLatentDataset(Dataset):
-    def __init__(self, index_path: str, load_target: bool = False):
-        with open(index_path) as f:
-            self.items = json.load(f)
-        self.root = os.path.dirname(os.path.abspath(index_path))
+    """Unified T2V/S2V/V2V/RV2V latent dataset."""
+
+    homogeneous_batches = True
+
+    def __init__(
+        self,
+        index_path: str,
+        load_target: bool = False,
+        *,
+        dataset_max_lat_frames: Any = None,
+    ):
+        self.index_path = Path(index_path).expanduser().resolve()
+        self.items = _load_items(self.index_path)
+        self.root = str(self.index_path.parent)  # legacy callers inspect this
         self.load_target = load_target
+        self.dataset_max_lat_frames = self._normalise_dataset_frame_caps(
+            dataset_max_lat_frames
+        )
+        self.legacy_max_frames = (
+            self._read_legacy_max_frames()
+            if dataset_max_lat_frames is None
+            else None
+        )
+        if load_target:
+            missing = [item["sample_id"] for item in self.items if not item.get("target")]
+            if missing:
+                preview = ", ".join(missing[:5])
+                raise ValueError(
+                    f"{self.index_path}: {len(missing)} samples have no target "
+                    f"(first: {preview})"
+                )
+        self.task_counts = dict(Counter(item["task_type"] for item in self.items))
+        self.dataset_counts = dict(
+            Counter(item["dataset"] or "unspecified" for item in self.items)
+        )
 
     def __len__(self):
         return len(self.items)
 
-    def _load(self, rel):
-        path = rel if os.path.isabs(rel) else os.path.join(self.root, rel)
-        return torch.load(path, map_location="cpu").float()
+    @staticmethod
+    def _load(path: str, max_frames: int | None = None):
+        try:
+            tensor = torch.load(path, map_location="cpu", mmap=True)
+        except (RuntimeError, ValueError):
+            tensor = torch.load(path, map_location="cpu")
+        if not torch.is_tensor(tensor):
+            raise TypeError(f"{path}: expected a tensor, got {type(tensor).__name__}")
+        if max_frames is not None and tensor.ndim > 0 and tensor.shape[0] > max_frames:
+            # clone releases the full long-video storage instead of returning a view
+            tensor = tensor[:max_frames].clone()
+        return _pad_latent_spatial(tensor.float())
 
-    def _load_raw(self, rel):
-        # like _load but preserves the stored dtype (text embeds are saved bf16).
-        path = rel if os.path.isabs(rel) else os.path.join(self.root, rel)
+    @staticmethod
+    def _load_raw(path: str):
         return torch.load(path, map_location="cpu")
 
+    @staticmethod
+    def _normalise_dataset_frame_caps(value: Any) -> dict[str, int] | None:
+        if value is None:
+            return None
+        if not hasattr(value, "items"):
+            raise TypeError("dataset_max_lat_frames must be a mapping")
+        caps: dict[str, int] = {}
+        for raw_dataset, raw_frames in value.items():
+            dataset = str(raw_dataset).strip().lower()
+            if not dataset:
+                raise ValueError("dataset_max_lat_frames has an empty dataset name")
+            frames = int(raw_frames)
+            if frames < 1:
+                raise ValueError(
+                    f"dataset_max_lat_frames[{dataset!r}] must be positive"
+                )
+            caps[dataset] = frames
+        return caps
+
+    @staticmethod
+    def _read_legacy_max_frames() -> int | None:
+        value = os.environ.get("EDIT_MAX_LAT_FRAMES")
+        if not value:
+            return None
+        frames = int(value)
+        if frames < 1:
+            raise ValueError("EDIT_MAX_LAT_FRAMES must be positive")
+        return frames
+
+    def _max_frames_for_item(self, item: dict) -> int | None:
+        if self.dataset_max_lat_frames is None:
+            return self.legacy_max_frames
+        return self.dataset_max_lat_frames.get(item["dataset"].lower())
+
+    @staticmethod
+    def _cap_shape_frames(value: Any, max_frames: int | None) -> Any:
+        if (
+            max_frames is None
+            or not isinstance(value, (list, tuple))
+            or not value
+        ):
+            return value
+        try:
+            frames = int(value[0])
+        except (TypeError, ValueError):
+            return value
+        return [min(frames, max_frames), *list(value[1:])]
+
+    def _effective_shape_metadata(self, item: dict) -> tuple:
+        max_frames = self._max_frames_for_item(item)
+        metadata = []
+        for field in _SHAPE_FIELDS:
+            value = item.get(field)
+            if value is None:
+                continue
+            if field in _TEMPORAL_SHAPE_FIELDS:
+                value = self._cap_shape_frames(value, max_frames)
+            metadata.append((field, _freeze(value)))
+        return tuple(metadata)
+
     def __getitem__(self, idx):
-        it = self.items[idx]
-        src = self._load(it["source"])  # [F, C, H, W]
-        # Optional smoke/debug knob: cap the number of latent frames to fit memory /
-        # speed up smoke tests. Cap source AND target by the same amount so the two
-        # streams stay frame-consistent (refs are single-frame, left untouched).
-        max_f = os.environ.get("EDIT_MAX_LAT_FRAMES")
-        if max_f:
-            src = src[: int(max_f)]
+        item = self.items[idx]
+        max_frames = self._max_frames_for_item(item)
         out = {
-            "prompts": it["prompt"],
-            "task_type": it.get("task_type", "v2v"),
-            # 显式编辑类型（add/remove/replace/convert/other），由数据标注写入 index.json，
-            # 训练据此决定区域加权（不再解析 prompt）。缺省 "" 表示未标注。
-            "edit_type": it.get("edit_type", ""),
-            "source_latent": src,
+            "prompts": item["prompt"],
+            "task_type": item["task_type"],
+            "edit_type": item["edit_type"],
+            "dataset": item["dataset"],
+            "sample_id": item["sample_id"],
         }
-        if it.get("refs"):
-            out["ref_latents"] = [self._load(r) for r in it["refs"]]  # list of [1, C, H, W]
-        if it.get("text_embed"):
-            # precomputed umT5 prompt embedding [L, D] (gen_text_embeds.py); when
-            # present, training skips the per-step text-encoder forward.
-            out["prompt_embeds"] = self._load_raw(it["text_embed"])
-        if self.load_target and it.get("target"):
-            tgt = self._load(it["target"])
-            if max_f:
-                tgt = tgt[: int(max_f)]
-            out["target_latent"] = tgt
+
+        if item.get("source"):
+            out["source_latent"] = self._load(item["source"], max_frames)
+        if item.get("refs"):
+            out["ref_latents"] = [self._load(path) for path in item["refs"]]
+        if item.get("text_embed"):
+            out["prompt_embeds"] = self._load_raw(item["text_embed"])
+        if self.load_target:
+            out["target_latent"] = self._load(item["target"], max_frames)
+        _align_visual_conditions(out)
         return out
+
+    def batch_key(self, idx: int) -> tuple:
+        """Metadata-only compatibility key used by the homogeneous sampler."""
+        item = self.items[idx]
+        shape_metadata = self._effective_shape_metadata(item)
+        return (
+            item["task_type"],
+            item["dataset"],
+            bool(item.get("source")),
+            len(item.get("refs") or []),
+            bool(item.get("text_embed")),
+            bool(self.load_target and item.get("target")),
+            shape_metadata,
+        )
 
 
 class EditODEDataset(Dataset):
-    """ODE-trajectory dataset for Stage 2 Option A.
+    """ODE trajectories with the same optional visual-condition schema."""
 
-    Index entries point to an `ode` latent `.pt` of shape [num_steps, F, C, H, W]
-    (most noisy -> clean GT) plus the editing condition (source + optional refs):
-
-        [{"prompt": "...", "ode": "00000_ode.pt",
-          "source": "00000_src.pt", "refs": ["00000_ref0.pt"]}, ...]
-    """
+    homogeneous_batches = True
 
     def __init__(self, index_path: str):
-        with open(index_path) as f:
-            self.items = json.load(f)
-        self.root = os.path.dirname(os.path.abspath(index_path))
+        self.index_path = Path(index_path).expanduser().resolve()
+        self.items = _load_items(self.index_path)
+        self.root = str(self.index_path.parent)
+        missing = [item["sample_id"] for item in self.items if not item.get("ode")]
+        if missing:
+            raise ValueError(f"{self.index_path}: {len(missing)} samples have no `ode`")
 
     def __len__(self):
         return len(self.items)
 
-    def _load(self, rel):
-        path = rel if os.path.isabs(rel) else os.path.join(self.root, rel)
-        return torch.load(path, map_location="cpu").float()
+    @staticmethod
+    def _load(path: str):
+        tensor = torch.load(path, map_location="cpu")
+        if not torch.is_tensor(tensor):
+            raise TypeError(f"{path}: expected a tensor, got {type(tensor).__name__}")
+        return _pad_latent_spatial(tensor.float())
 
     def __getitem__(self, idx):
-        it = self.items[idx]
+        item = self.items[idx]
         out = {
-            "prompts": it["prompt"],
-            "task_type": it.get("task_type", "v2v"),
-            "ode_latent": self._load(it["ode"]),        # [num_steps, F, C, H, W]
-            "source_latent": self._load(it["source"]),  # [F, C, H, W]
+            "prompts": item["prompt"],
+            "task_type": item["task_type"],
+            "edit_type": item["edit_type"],
+            "dataset": item["dataset"],
+            "sample_id": item["sample_id"],
+            "ode_latent": self._load(item["ode"]),
         }
-        if it.get("refs"):
-            out["ref_latents"] = [self._load(r) for r in it["refs"]]
+        if item.get("source"):
+            out["source_latent"] = self._load(item["source"])
+        if item.get("refs"):
+            out["ref_latents"] = [self._load(path) for path in item["refs"]]
+        _align_visual_conditions(out)
         return out
 
+    def batch_key(self, idx: int) -> tuple:
+        item = self.items[idx]
+        shape_metadata = tuple(
+            (field, _freeze(item[field]))
+            for field in _SHAPE_FIELDS
+            if item.get(field) is not None
+        )
+        return (
+            item["task_type"],
+            item["dataset"],
+            bool(item.get("source")),
+            len(item.get("refs") or []),
+            shape_metadata,
+        )
 
-def edit_ode_collate(batch: List[dict]) -> dict:
-    out = {"prompts": [b["prompts"] for b in batch],
-           "task_type": [b["task_type"] for b in batch]}
-    out["ode_latent"] = torch.stack([b["ode_latent"] for b in batch], dim=0)  # [B,num_steps,F,C,H,W]
-    out["source_latent"] = torch.stack([b["source_latent"] for b in batch], dim=0)
-    if "ref_latents" in batch[0]:
-        n_ref = len(batch[0]["ref_latents"])
-        out["ref_latents"] = [torch.stack([b["ref_latents"][i] for b in batch], dim=0)
-                              for i in range(n_ref)]
-    return out
+
+def _stack(tensors: Iterable[torch.Tensor], key: str) -> torch.Tensor:
+    values = list(tensors)
+    try:
+        return torch.stack(values)
+    except RuntimeError as exc:
+        shapes = [tuple(value.shape) for value in values]
+        raise ValueError(
+            f"incompatible `{key}` shapes in one batch: {shapes}; "
+            "use the homogeneous sampler or batch_size=1"
+        ) from exc
+
+
+def _collate_optional_tensor(batch: List[dict], key: str, output: dict) -> None:
+    present = [key in item for item in batch]
+    if any(present) and not all(present):
+        raise ValueError(
+            f"mixed `{key}` presence in one batch; use the homogeneous sampler "
+            "or batch_size=1"
+        )
+    if all(present):
+        output[key] = _stack((item[key] for item in batch), key)
+
+
+def _collate_refs(batch: List[dict], output: dict) -> None:
+    counts = [len(item.get("ref_latents", [])) for item in batch]
+    if len(set(counts)) != 1:
+        raise ValueError(
+            f"mixed reference counts in one batch: {counts}; "
+            "use the homogeneous sampler or batch_size=1"
+        )
+    if counts[0]:
+        output["ref_latents"] = [
+            _stack((item["ref_latents"][ref_idx] for item in batch), "ref_latents")
+            for ref_idx in range(counts[0])
+        ]
+
+
+def _collate_metadata(batch: List[dict]) -> dict:
+    return {
+        "prompts": [item["prompts"] for item in batch],
+        "task_types": [item["task_type"] for item in batch],
+        "edit_types": [item["edit_type"] for item in batch],
+        "datasets": [item.get("dataset", "") for item in batch],
+        "sample_ids": [item.get("sample_id", "") for item in batch],
+    }
 
 
 def edit_collate(batch: List[dict]) -> dict:
-    """Batch collate that keeps the editing condition aligned per sample.
+    output = _collate_metadata(batch)
+    _collate_optional_tensor(batch, "source_latent", output)
+    _collate_refs(batch, output)
+    _collate_optional_tensor(batch, "target_latent", output)
+    _collate_optional_tensor(batch, "prompt_embeds", output)
+    return output
 
-    Stacks `source_latent` (assumes equal shapes within a batch; use batch_size=1
-    for variable-length source videos, which is the default for this stage).
+
+def edit_ode_collate(batch: List[dict]) -> dict:
+    output = _collate_metadata(batch)
+    output["ode_latent"] = _stack((item["ode_latent"] for item in batch), "ode_latent")
+    _collate_optional_tensor(batch, "source_latent", output)
+    _collate_refs(batch, output)
+    return output
+
+
+class HomogeneousDistributedBatchSampler(Sampler[list[int]]):
+    """Task/shape-homogeneous batches aligned across distributed ranks.
+
+    Small buckets are deterministically padded, rather than dropped, so rare tasks
+    and resolution buckets remain represented in every epoch.
     """
-    out = {"prompts": [b["prompts"] for b in batch],
-           "task_type": [b["task_type"] for b in batch],
-           "edit_types": [b.get("edit_type", "") for b in batch]}
-    out["source_latent"] = torch.stack([b["source_latent"] for b in batch], dim=0)  # [B,F,C,H,W]
-    if "ref_latents" in batch[0]:
-        # list (over refs) of [B,1,C,H,W]
-        n_ref = len(batch[0]["ref_latents"])
-        out["ref_latents"] = [torch.stack([b["ref_latents"][i] for b in batch], dim=0)
-                              for i in range(n_ref)]
-    if "prompt_embeds" in batch[0]:
-        # precomputed umT5 embeds [L, D] -> [B, L, D] (L is the fixed tokenizer pad len).
-        out["prompt_embeds"] = torch.stack([b["prompt_embeds"] for b in batch], dim=0)
-    if "target_latent" in batch[0]:
-        out["target_latent"] = torch.stack([b["target_latent"] for b in batch], dim=0)
-    return out
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        *,
+        num_replicas: int = 1,
+        rank: int = 0,
+        shuffle: bool = True,
+        seed: int = 0,
+    ):
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if num_replicas < 1 or rank < 0 or rank >= num_replicas:
+            raise ValueError("invalid distributed sampler rank/replica configuration")
+        if not hasattr(dataset, "batch_key"):
+            raise TypeError("dataset must implement batch_key(index)")
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+        groups = defaultdict(list)
+        for index in range(len(dataset)):
+            groups[dataset.batch_key(index)].append(index)
+        self.groups = dict(groups)
+        self.global_batch_size = self.batch_size * self.num_replicas
+        self.num_batches = sum(
+            math.ceil(len(indices) / self.global_batch_size)
+            for indices in self.groups.values()
+        )
+
+    def __len__(self):
+        return self.num_batches
+
+    def __iter__(self):
+        epoch = self.epoch
+        self.epoch += 1
+        rng = random.Random(self.seed + epoch)
+        rank_batches = []
+        for key in sorted(self.groups, key=repr):
+            indices = list(self.groups[key])
+            if self.shuffle:
+                rng.shuffle(indices)
+            remainder = len(indices) % self.global_batch_size
+            if remainder:
+                needed = self.global_batch_size - remainder
+                indices.extend(indices[i % len(indices)] for i in range(needed))
+            for start in range(0, len(indices), self.global_batch_size):
+                global_batch = indices[start : start + self.global_batch_size]
+                rank_start = self.rank * self.batch_size
+                rank_batches.append(
+                    global_batch[rank_start : rank_start + self.batch_size]
+                )
+        if self.shuffle:
+            rng.shuffle(rank_batches)
+        yield from rank_batches

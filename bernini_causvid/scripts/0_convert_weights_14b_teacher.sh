@@ -3,7 +3,7 @@
 set -e
 
 CF_ROOT="${CF_ROOT:-/opt/dlami/nvme/chenxinyu/project/Causal-Forcing}"
-PY="${PY:-/opt/dlami/nvme/miniconda3/envs/causal-forcing/bin/python}"
+PY="${PY:-/opt/conda/envs/causvid/bin/python}"
 : "${BERNINI_DIR:?Set BERNINI_DIR to the AWS Bernini-R-Diffusers directory}"
 HIGH_OUT="${HIGH_OUT:-wan_models/Bernini-R-14B-high}"
 LOW_OUT="${LOW_OUT:-wan_models/Bernini-R-14B-low}"

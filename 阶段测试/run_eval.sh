@@ -11,7 +11,7 @@
 #     bash 阶段测试/run_eval.sh
 set -e
 CF_ROOT="/apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing"
-PY="/apdcephfs_hzlf/share_1227201/xinyu/conda_setup/miniconda3/envs/causal_forcing/bin/python"
+PY="${PY:-/opt/conda/envs/causvid/bin/python}"
 cd "$CF_ROOT"
 
 CKPT="${CKPT:?请设置 CKPT=.../checkpoint_model_XXXXXX/model.pt}"   # 必填：模型权重

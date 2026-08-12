@@ -128,13 +128,17 @@ def save_sample(model, sample_batch, build_cond, device, dtype, out_path,
         vae=None,
     )
 
-    source = cond["source_latents"][0]
-    rng = torch.Generator(device=source.device)
+    sample_latent = sample_batch.get("source_latent")
+    if sample_latent is None:
+        sample_latent = sample_batch.get("target_latent")
+    if sample_latent is None:
+        raise RuntimeError("sampling needs a source or target latent for output shape")
+    rng = torch.Generator(device=sample_latent.device)
     rng.manual_seed(int(sample_seed))
     noise = torch.randn(
-        source.shape,
-        device=source.device,
-        dtype=source.dtype,
+        sample_latent.shape,
+        device=sample_latent.device,
+        dtype=sample_latent.dtype,
         generator=rng,
     )
     denoised = pipeline.inference(
@@ -391,9 +395,14 @@ def main():
                 uncond_cache = {
                     "prompt_embeds": u["prompt_embeds"][:1].detach()
                 }
-        cond["source_latents"] = [batch["source_latent"].to(device, dtype)]
+        if "source_latent" in batch:
+            cond["source_latents"] = [
+                batch["source_latent"].to(device, dtype)
+            ]
         if "ref_latents" in batch:
-            cond["ref_latents"] = [r.to(device, dtype) for r in batch["ref_latents"]]
+            cond["ref_latents"] = [
+                ref.to(device, dtype) for ref in batch["ref_latents"]
+            ]
         uncond = {
             "prompt_embeds": uncond_cache["prompt_embeds"].expand(
                 b, -1, -1
@@ -402,8 +411,14 @@ def main():
         return cond, uncond
 
     def noise_shape(batch):
-        s = batch["source_latent"].shape  # [B,F,C,H,W]
-        return [s[0], s[1], s[2], s[3], s[4]]
+        shape_tensor = batch.get("source_latent")
+        if shape_tensor is None:
+            shape_tensor = batch.get("target_latent")
+        if shape_tensor is None:
+            raise RuntimeError(
+                "a source-free batch needs `target_latent` to define noise shape"
+            )
+        return list(shape_tensor.shape)  # [B,F,C,H,W]
 
     # 固定的评测样本，使各步进度视频可纵向比较；每种编辑类型（增/删/改）各取一条。
     kinds = [k for k, _ in EDIT_KINDS]
@@ -432,8 +447,14 @@ def main():
             meta["samples"][kind] = {"index": idx,
                                      "prompt": dataset.items[idx].get("prompt", "")}
             try:
-                _decode_latent_to_mp4(model, eb["source_latent"], device, dtype,
-                                      os.path.join(sample_dir, f"_source_{kind}.mp4"))
+                if "source_latent" in eb:
+                    _decode_latent_to_mp4(
+                        model, eb["source_latent"], device, dtype,
+                        os.path.join(sample_dir, f"_source_{kind}.mp4"))
+                for ref_index, ref_latent in enumerate(eb.get("ref_latents", [])):
+                    _decode_latent_to_mp4(
+                        model, ref_latent, device, dtype,
+                        os.path.join(sample_dir, f"_ref{ref_index}_{kind}.mp4"))
                 if "target_latent" in eb:
                     _decode_latent_to_mp4(model, eb["target_latent"], device, dtype,
                                           os.path.join(sample_dir, f"_target_{kind}.mp4"))

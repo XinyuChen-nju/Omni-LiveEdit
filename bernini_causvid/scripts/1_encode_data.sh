@@ -16,7 +16,7 @@
 # 然后合并：python bernini_causvid/tools/merge_index_shards.py --out_dir <OUT_DIR>
 set -e
 CF_ROOT="/apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing"
-PY="/apdcephfs_hzlf/share_1227201/xinyu/conda_setup/miniconda3/envs/causal_forcing/bin/python"
+PY="${PY:-/opt/conda/envs/causvid/bin/python}"
 cd "$CF_ROOT"
 
 DATA_ROOT="/apdcephfs_hzlf/share_1227201/xinyu/Dataset/ReCo/distill_for_bernini"  # ReCo 编辑数据根目录

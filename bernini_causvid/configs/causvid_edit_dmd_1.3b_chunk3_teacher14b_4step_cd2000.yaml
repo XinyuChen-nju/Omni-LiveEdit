@@ -50,7 +50,9 @@ trainer: score_distillation
 denoising_loss_type: flow
 denoising_step_list:
 - 1000
+- 750
 - 500
+- 250
 warp_denoising_step: true
 ts_schedule: false
 min_score_timestep: 0

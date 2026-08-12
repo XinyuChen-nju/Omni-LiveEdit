@@ -9,7 +9,7 @@
 #   跳过轨迹生成（已生成）：SKIP_GEN=1 bash .../3_stage2_train_ode.sh
 set -e
 CF_ROOT="/apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing"
-PY="/apdcephfs_hzlf/share_1227201/xinyu/conda_setup/miniconda3/envs/causal_forcing/bin/python"
+PY="${PY:-/opt/conda/envs/causvid/bin/python}"
 cd "$CF_ROOT"
 
 INDEX="${INDEX:-data/edit_lat/index.json}"   # Stage 1 用的 latents 索引（轨迹生成的输入数据）

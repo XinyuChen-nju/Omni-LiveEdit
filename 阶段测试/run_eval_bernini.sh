@@ -8,7 +8,7 @@
 #   NUM_CASES=2 GUIDANCE_MODE=v2v_apg bash 阶段测试/run_eval_bernini.sh
 set -e
 CF_ROOT="/apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing"
-PY="/apdcephfs_hzlf/share_1227201/xinyu/conda_setup/miniconda3/envs/causal_forcing/bin/python"
+PY="${PY:-/opt/conda/envs/causvid/bin/python}"
 cd "$CF_ROOT"
 
 # Bernini 源模型权重目录（含 config.json + diffusion_pytorch_model.safetensors）。

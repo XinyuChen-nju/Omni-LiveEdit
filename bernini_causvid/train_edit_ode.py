@@ -140,9 +140,14 @@ def main():
     def build_cond(batch):
         with torch.no_grad():
             cond = dict(model.text_encoder(text_prompts=batch["prompts"]))
-        cond["source_latents"] = [batch["source_latent"].to(device, dtype)]
+        if "source_latent" in batch:
+            cond["source_latents"] = [
+                batch["source_latent"].to(device, dtype)
+            ]
         if "ref_latents" in batch:
-            cond["ref_latents"] = [r.to(device, dtype) for r in batch["ref_latents"]]
+            cond["ref_latents"] = [
+                ref.to(device, dtype) for ref in batch["ref_latents"]
+            ]
         return cond
 
     log(f"[train] start at step {step}, max_iters {args.max_iters}")

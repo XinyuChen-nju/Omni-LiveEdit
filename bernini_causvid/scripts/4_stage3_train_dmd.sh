@@ -6,7 +6,7 @@
 #   多机：             用 bernini_causvid/multinode/launch.sh 一键拉起（推荐）
 set -e
 CF_ROOT="/opt/dlami/nvme/chenxinyu/project/Causal-Forcing"
-PY="/opt/dlami/nvme/miniconda3/envs/causal-forcing/bin/python"
+PY="${PY:-/opt/conda/envs/causvid/bin/python}"
 cd "$CF_ROOT"
 
 # 训练超参：均可用同名环境变量覆盖（多机时由 launch.sh 统一下发）。
@@ -29,7 +29,7 @@ GRAD_ACCUM="${GRAD_ACCUM:--1}"            # 梯度累积（-1=读 config）
 # 单机走 --standalone；多机走静态 rendezvous（worker 直连主节点，按 --node_rank 编号）。
 # 不用 --rdzv_backend=c10d：它与 --node_rank 混用会让 worker 各自成组、无法汇入同一 world。
 if [ "$NNODES" = "1" ]; then
-    RDZV_ARGS=(--standalone)
+    RDZV_ARGS=(--nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --master_port=29500)
 else
     RDZV_ARGS=(--nnodes="$NNODES" --node_rank="$NODE_RANK" \
                --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT")

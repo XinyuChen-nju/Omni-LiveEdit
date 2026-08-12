@@ -60,8 +60,9 @@ class EditCausalInferencePipeline(torch.nn.Module):
 
         frame_seq = edit_frame_seq(self.generator, h, w)
         source, refs = get_source_refs(conditional_dict)
-        assert source is not None and source.shape[1] == num_frames, \
-            "streamed-causal editing needs a frame-aligned source video"
+        if source is not None and source.shape[1] != num_frames:
+            raise ValueError(
+                "streamed-causal editing needs a frame-aligned source video")
 
         ref_tokens = sum(r.shape[1] for r in refs) * frame_seq
         cond_cache, tgt_cache, crossattn_cache = alloc_edit_caches(
@@ -79,7 +80,8 @@ class EditCausalInferencePipeline(torch.nn.Module):
             cur_tgt_start = fs * frame_seq
 
             # source mode: fixed timestep, so each source block is cached once.
-            if self.source_timestep_mode == "source":
+            # T2V has no source stream and uses only text + target history.
+            if source is not None and self.source_timestep_mode == "source":
                 self.generator(
                     stream_mode="prefill_cond",
                     cond_latent=source[:, sl], source_id=SOURCE_SID, rope_start_frame=fs,
@@ -93,7 +95,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
             for i, ts in enumerate(denoise_list):
                 # target mode: source time embedding follows the current target t.
                 # Rebuild all visible source blocks so no stale-timestep K/V remains.
-                if self.source_timestep_mode == "target":
+                if source is not None and self.source_timestep_mode == "target":
                     refresh_visible_source(
                         self.generator, conditional_dict, source,
                         cond_cache, crossattn_cache, frame_seq, ref_tokens,

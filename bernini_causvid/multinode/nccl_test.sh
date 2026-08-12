@@ -3,7 +3,7 @@
 #   一键双机：bash bernini_causvid/multinode/launch.sh nccl_test <worker_ip>
 set -e
 CF_ROOT="/apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing"
-PY="/apdcephfs_hzlf/share_1227201/xinyu/conda_setup/miniconda3/envs/causal_forcing/bin/python"
+PY="${PY:-/opt/conda/envs/causvid/bin/python}"
 MN_DIR="$CF_ROOT/bernini_causvid/multinode"
 cd "$CF_ROOT"
 

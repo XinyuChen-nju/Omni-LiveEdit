@@ -246,13 +246,19 @@ class EditDiffusion(nn.Module):
         edit_region_loss = edit_frac = None
         if self.region_loss and src_clean is not None and src_clean.shape == clean_latent.shape:
             mask = self._edit_region_mask(src_clean, clean_latent)           # [B, F, 1, H, W]
-            # 按数据里的 edit_type 逐样本决定是否用区域加权：映射里显式为 false 的类型
-            # （如风格化 convert）把 mask 置 0，权重退回全帧均匀 1，避免弱变化区被压低；
-            # 其余类型（默认 true）保持 ReCo 区域强化。
-            if edit_types is not None and self.region_loss_by_type and len(edit_types) == b:
+            # Every dataset may provide edit_type. Empty means not annotated yet;
+            # configured non-empty types may enable region weighting.
+            if edit_types is not None and len(edit_types) == b:
+                mapping = self.region_loss_by_type or {}
+                keys = [str(edit_type or "").strip().lower()
+                        for edit_type in edit_types]
                 gate = torch.tensor(
-                    [1.0 if self.region_loss_by_type.get(str(t).lower(), True) else 0.0
-                     for t in edit_types],
+                    [
+                        1.0
+                        if key and (mapping.get(key, False) if mapping else True)
+                        else 0.0
+                        for key in keys
+                    ],
                     device=mask.device, dtype=mask.dtype,
                 ).view(b, *([1] * (mask.dim() - 1)))                          # [B,1,1,1,1]
                 mask = mask * gate

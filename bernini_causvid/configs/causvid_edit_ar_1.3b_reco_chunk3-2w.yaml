@@ -38,7 +38,7 @@ denoising_loss_type: flow         # 去噪回归损失：flow（flow-matching）
 # 大面积易复制背景淹没、梯度被稀释（导致后续帧编辑塌回源）。mask 逐帧由
 # |target-source| 现算。region_loss=false 时与原损失完全一致。
 region_loss: true                 # 总开关
-region_edit_weight: 4.0           # 编辑区额外权重：该区 loss 乘 (1+该值)
+region_edit_weight: 2.0           # 编辑区额外权重：该区 loss 乘 (1+该值)
 region_mask_threshold: 0.10       # 归一化 src↔tgt 差异 > 该阈值判为编辑区（硬 mask）
 region_mask_soft: false           # false=硬 mask(0/1)；true=连续软权重(0~1)
 region_weight_normalize: true     # 逐帧把权重均值归一到 1，保持 loss 量级/学习率稳定

@@ -1,38 +1,39 @@
 #!/usr/bin/env bash
 # Stage 1：AR（teacher-forcing）编辑扩散训练（多卡 / 多机，FSDP）。
 # 产出 ar_diffusion 检查点。需要带 `target` 的 index.json（gen_edit_targets.py 生成）。
-# 从 Causal-Forcing 仓库根目录运行。
+# 从 Universal-Edit-Forcing 仓库根目录运行。
 #
 #   单机 8 卡（默认）： bash bernini_causvid/scripts/2_stage1_train_ar.sh
 #   少卡：             NPROC_PER_NODE=4 bash .../2_stage1_train_ar.sh
 #   多机：             用 bernini_causvid/multinode/launch.sh 一键拉起（推荐）
 set -e
 set -o pipefail
-CF_ROOT="${CF_ROOT:-/opt/dlami/nvme/chenxinyu/project/Causal-Forcing}"
-PY="${PY:-/opt/dlami/nvme/miniconda3/envs/causal-forcing/bin/python}"
+CF_ROOT="${CF_ROOT:-/opt/dlami/nvme/chenxinyu/project/Universal-Edit-Forcing}"
+PY="${PY:-/opt/conda/envs/causvid/bin/python}"
 cd "$CF_ROOT"
 
 # 训练超参：均可用同名环境变量覆盖（多机时由 launch.sh 统一下发）。
-CONFIG="${CONFIG:-bernini_causvid/configs/causvid_edit_ar_1.3b_reco_chunk3-2w.yaml}"
-RUN_NAME="${RUN_NAME:-bernini_edit_ar}"
+CONFIG="${CONFIG:-bernini_causvid/configs/causvid_edit_ar_1.3b_universal.yaml}"
+RUN_NAME="${RUN_NAME:-universal_edit_ar}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 LOGDIR="${LOGDIR:-runs/${RUN_NAME}/${TIMESTAMP}}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"     # 每节点 GPU 数
 NNODES="${NNODES:-1}"                     # 节点数，>1 即多机
 NODE_RANK="${NODE_RANK:-0}"               # 当前节点编号
-MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"   # 主节点 IP
+MASTER_ADDR="${MASTER_ADDR:-10.1.4.248}"   # 主节点 IP
 MASTER_PORT="${MASTER_PORT:-29500}"       # 主节点端口
 MAX_ITERS="${MAX_ITERS:-5000}"            # 总训练步数
 SAVE_EVERY="${SAVE_EVERY:-100}"           # 每多少步存一次 ckpt
 LOG_EVERY="${LOG_EVERY:-10}"              # 每多少步打一次日志
 RESUME="${RESUME:-auto}"                  # auto=自动找最新 ckpt / 具体路径 / none
-SAMPLE_STEPS="${SAMPLE_STEPS:-8}"         # 采样推理步数（-1=跑满 1000，极慢）
+SAMPLE_STEPS="${SAMPLE_STEPS:-50}"         # 采样推理步数（-1=跑满 1000，极慢）
 GRAD_ACCUM="${GRAD_ACCUM:-1}"             # 梯度累积（-1=读 config）
 
-# 单机走 --standalone；多机走静态 rendezvous（worker 直连主节点，按 --node_rank 编号）。
-# 不用 --rdzv_backend=c10d：它与 --node_rank 混用会让 worker 各自成组、无法汇入同一 world。
+# Docker 内单机也使用静态 rendezvous；--standalone 可能将容器 hostname
+# 解析为不可达地址，导致 c10d server socket 超时。
 if [ "$NNODES" = "1" ]; then
-    RDZV_ARGS=(--standalone)
+    RDZV_ARGS=(--nnodes=1 --node_rank=0 \
+               --master_addr=127.0.0.1 --master_port="$MASTER_PORT")
 else
     RDZV_ARGS=(--nnodes="$NNODES" --node_rank="$NODE_RANK" \
                --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT")

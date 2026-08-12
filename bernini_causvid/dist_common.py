@@ -190,7 +190,27 @@ def load_optim_state_dict(model: torch.nn.Module, optim: torch.optim.Optimizer,
 
 def make_loader(dataset, batch_size, collate_fn, distributed: bool,
                 num_workers: int = 4):
-    """DataLoader with a DistributedSampler when running distributed."""
+    """Build a loader, preserving task/shape homogeneity for unified edit data."""
+    if getattr(dataset, "homogeneous_batches", False):
+        from bernini_causvid.data.edit_dataset import (
+            HomogeneousDistributedBatchSampler,
+        )
+
+        replicas = torch.distributed.get_world_size() if distributed else 1
+        rank = torch.distributed.get_rank() if distributed else 0
+        batch_sampler = HomogeneousDistributedBatchSampler(
+            dataset,
+            batch_size,
+            num_replicas=replicas,
+            rank=rank,
+            shuffle=True,
+        )
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+        )
     if distributed:
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)

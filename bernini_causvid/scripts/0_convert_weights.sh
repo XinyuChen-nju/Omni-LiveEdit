@@ -5,7 +5,7 @@ set -e
 
 CF_ROOT="/apdcephfs_hzlf/share_1227201/xinyu/Causal-Forcing"                                  # 仓库根目录
 BERNINI_DIR="/apdcephfs_hzlf/share_1227201/xinyu/my_project/Bernini/Bernini-R-1.3B-Diffusers"  # 输入：Bernini-R 1.3B diffusers 权重目录
-PY="/apdcephfs_hzlf/share_1227201/xinyu/conda_setup/miniconda3/envs/causal_forcing/bin/python" # conda 环境的 python
+PY="${PY:-/opt/conda/envs/causvid/bin/python}"
 
 cd "$CF_ROOT"
 # 参数说明：
