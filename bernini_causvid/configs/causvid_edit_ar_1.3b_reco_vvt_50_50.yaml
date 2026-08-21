@@ -11,10 +11,6 @@ num_frame_per_block: 3
 timestep_shift: 5.0
 cache_text_embeds: true
 
-# OpenVid: at most 21 latent frames (81 RGB frames).
-dataset_max_lat_frames:
-  openvid: 21
-
 teacher_forcing: true
 noise_augmentation_max_timestep: 100
 source_noise_max_timestep: 100
@@ -63,21 +59,17 @@ seed: 0
 # forward_edit calls within one optimization step.
 sharding_strategy: grad_op
 
-data_path: /opt/dlami/nvme/chenxinyu/data/Universal-Edit-Metadata/mixed_train/index_instruction.json
+data_path: /opt/dlami/nvme/chenxinyu/data/Universal-Edit-Metadata/mixed_train/index-reco6w-vvt6k.json
 
 # Per-dataset sampling ratios. Values are normalized automatically and allocate
 # batches exactly by ratio while preserving task/shape-homogeneous batches.
 dataset_sampling_weights:
-  openvid: 0.40
-  reco: 0.40
-  tripvvt: 0.20
+  reco: 0.50
+  tripvvt: 0.50
 
 # Fixed qualitative validation coverage. Every configured group must match, and
 # train_edit_ar.py refuses to start if any task_type in the training index is absent.
 eval_samples:
-- name: t2v_openvid
-  dataset: openvid
-  task_type: t2v
 - name: v2v_reco_add
   dataset: reco
   task_type: v2v

@@ -515,8 +515,9 @@ def edit_ode_collate(batch: List[dict]) -> dict:
 class HomogeneousDistributedBatchSampler(Sampler[list[int]]):
     """Task/shape-homogeneous batches aligned across distributed ranks.
 
-    Small buckets are deterministically padded, rather than dropped, so rare tasks
-    and resolution buckets remain represented in every epoch.
+    Small buckets are deterministically padded, rather than dropped. When
+    ``dataset_sampling_weights`` is set, the epoch keeps its natural batch count
+    but allocates those batches to datasets according to the configured ratios.
     """
 
     def __init__(
@@ -528,6 +529,7 @@ class HomogeneousDistributedBatchSampler(Sampler[list[int]]):
         rank: int = 0,
         shuffle: bool = True,
         seed: int = 0,
+        dataset_sampling_weights: Any = None,
     ):
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -547,19 +549,71 @@ class HomogeneousDistributedBatchSampler(Sampler[list[int]]):
             groups[dataset.batch_key(index)].append(index)
         self.groups = dict(groups)
         self.global_batch_size = self.batch_size * self.num_replicas
-        self.num_batches = sum(
-            math.ceil(len(indices) / self.global_batch_size)
-            for indices in self.groups.values()
+        self.group_datasets = {
+            key: str(dataset.items[indices[0]]["dataset"])
+            for key, indices in self.groups.items()
+        }
+        self.natural_dataset_batch_counts = Counter(
+            {
+                name: sum(
+                    math.ceil(len(indices) / self.global_batch_size)
+                    for key, indices in self.groups.items()
+                    if self.group_datasets[key] == name
+                )
+                for name in set(self.group_datasets.values())
+            }
         )
+        self.num_batches = sum(self.natural_dataset_batch_counts.values())
+        self.dataset_sampling_weights = self._normalise_dataset_weights(
+            dataset_sampling_weights
+        )
+        self.dataset_batch_counts = self._allocate_dataset_batches()
+
+    def _normalise_dataset_weights(self, weights: Any) -> dict[str, float] | None:
+        if weights is None:
+            return None
+        values = {str(name): float(value) for name, value in dict(weights).items()}
+        expected = set(self.natural_dataset_batch_counts)
+        configured = set(values)
+        if configured != expected:
+            missing = sorted(expected - configured)
+            unknown = sorted(configured - expected)
+            raise ValueError(
+                "dataset_sampling_weights must name every dataset; "
+                f"missing={missing}, unknown={unknown}"
+            )
+        invalid = {
+            name: value
+            for name, value in values.items()
+            if not math.isfinite(value) or value < 0
+        }
+        if invalid or sum(values.values()) <= 0:
+            raise ValueError(
+                "dataset_sampling_weights must be finite, non-negative, and "
+                f"have a positive sum; invalid={invalid}"
+            )
+        total = sum(values.values())
+        return {name: value / total for name, value in values.items()}
+
+    def _allocate_dataset_batches(self) -> Counter:
+        if self.dataset_sampling_weights is None:
+            return self.natural_dataset_batch_counts.copy()
+        raw = {
+            name: weight * self.num_batches
+            for name, weight in self.dataset_sampling_weights.items()
+        }
+        counts = Counter({name: math.floor(value) for name, value in raw.items()})
+        remaining = self.num_batches - sum(counts.values())
+        order = sorted(raw, key=lambda name: (-(raw[name] - counts[name]), name))
+        for name in order[:remaining]:
+            counts[name] += 1
+        return counts
 
     def __len__(self):
         return self.num_batches
 
-    def __iter__(self):
-        epoch = self.epoch
-        self.epoch += 1
-        rng = random.Random(self.seed + epoch)
-        rank_batches = []
+    def _global_batches_by_dataset(self, rng: random.Random) -> dict[str, list[list[int]]]:
+        result = defaultdict(list)
         for key in sorted(self.groups, key=repr):
             indices = list(self.groups[key])
             if self.shuffle:
@@ -568,12 +622,31 @@ class HomogeneousDistributedBatchSampler(Sampler[list[int]]):
             if remainder:
                 needed = self.global_batch_size - remainder
                 indices.extend(indices[i % len(indices)] for i in range(needed))
+            dataset_name = self.group_datasets[key]
             for start in range(0, len(indices), self.global_batch_size):
-                global_batch = indices[start : start + self.global_batch_size]
-                rank_start = self.rank * self.batch_size
-                rank_batches.append(
-                    global_batch[rank_start : rank_start + self.batch_size]
+                result[dataset_name].append(
+                    indices[start : start + self.global_batch_size]
                 )
+        return dict(result)
+
+    def __iter__(self):
+        epoch = self.epoch
+        self.epoch += 1
+        rng = random.Random(self.seed + epoch)
+        batches_by_dataset = self._global_batches_by_dataset(rng)
+        global_batches = []
+        for dataset_name in sorted(self.dataset_batch_counts):
+            target_count = self.dataset_batch_counts[dataset_name]
+            pool = batches_by_dataset[dataset_name]
+            selected = []
+            while len(selected) < target_count:
+                cycle = list(pool)
+                if self.shuffle:
+                    rng.shuffle(cycle)
+                selected.extend(cycle[: target_count - len(selected)])
+            global_batches.extend(selected)
         if self.shuffle:
-            rng.shuffle(rank_batches)
-        yield from rank_batches
+            rng.shuffle(global_batches)
+        rank_start = self.rank * self.batch_size
+        for global_batch in global_batches:
+            yield global_batch[rank_start : rank_start + self.batch_size]

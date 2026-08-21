@@ -319,8 +319,19 @@ def main():
         load_target=True,
         dataset_max_lat_frames=getattr(cfg, "dataset_max_lat_frames", None),
     )
-    loader = D.make_loader(dataset, cfg.batch_size, edit_collate, distributed)
+    loader = D.make_loader(
+        dataset,
+        cfg.batch_size,
+        edit_collate,
+        distributed,
+        dataset_sampling_weights=getattr(cfg, "dataset_sampling_weights", None),
+    )
     data = cycle(loader)
+    if hasattr(loader.batch_sampler, "dataset_batch_counts"):
+        log(
+            "[train] dataset batches per epoch "
+            + str(dict(sorted(loader.batch_sampler.dataset_batch_counts.items())))
+        )
     log(f"[train] dataset size {len(dataset)} | grad_accum {grad_accum} | global batch "
         f"{cfg.batch_size * dist_info['world_size'] * grad_accum} "
         f"(per-gpu micro-batch {cfg.batch_size} x world {dist_info['world_size']} x accum {grad_accum})")
