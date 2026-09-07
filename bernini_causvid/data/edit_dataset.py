@@ -382,6 +382,7 @@ class EditLatentDataset(Dataset):
         item = self.items[idx]
         shape_metadata = self._effective_shape_metadata(item)
         return (
+            item["edit_type"],
             item["task_type"],
             item["dataset"],
             bool(item.get("source")),
@@ -434,11 +435,7 @@ class EditODEDataset(Dataset):
 
     def batch_key(self, idx: int) -> tuple:
         item = self.items[idx]
-        shape_metadata = tuple(
-            (field, _freeze(item[field]))
-            for field in _SHAPE_FIELDS
-            if item.get(field) is not None
-        )
+        shape_metadata = self._effective_shape_metadata(item)
         return (
             item["task_type"],
             item["dataset"],
@@ -530,6 +527,7 @@ class HomogeneousDistributedBatchSampler(Sampler[list[int]]):
         shuffle: bool = True,
         seed: int = 0,
         dataset_sampling_weights: Any = None,
+        gradient_accumulation_steps: int = 1,
     ):
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -544,6 +542,7 @@ class HomogeneousDistributedBatchSampler(Sampler[list[int]]):
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.epoch = 0
+        self.grad_accum = max(1, int(gradient_accumulation_steps))
         groups = defaultdict(list)
         for index in range(len(dataset)):
             groups[dataset.batch_key(index)].append(index)
@@ -612,6 +611,35 @@ class HomogeneousDistributedBatchSampler(Sampler[list[int]]):
     def __len__(self):
         return self.num_batches
 
+    def _edit_type_of_global_batch(self, global_batch: list[int]) -> str:
+        return str(self.dataset.items[global_batch[0]]["edit_type"])
+
+    def _pack_global_batches_for_accum(
+        self, global_batches: list[list[int]], rng: random.Random
+    ) -> list[list[int]]:
+        accum = self.grad_accum
+        if accum <= 1 or not global_batches:
+            return global_batches
+        by_type: dict[str, list[list[int]]] = defaultdict(list)
+        for global_batch in global_batches:
+            by_type[self._edit_type_of_global_batch(global_batch)].append(global_batch)
+        chunks: list[list[list[int]]] = []
+        for batches in by_type.values():
+            pool = list(batches)
+            if self.shuffle:
+                rng.shuffle(pool)
+            for start in range(0, len(pool), accum):
+                chunk = pool[start : start + accum]
+                while len(chunk) < accum:
+                    chunk.append(pool[len(chunk) % len(pool)])
+                chunks.append(chunk)
+        if self.shuffle:
+            rng.shuffle(chunks)
+        packed: list[list[int]] = []
+        for chunk in chunks:
+            packed.extend(chunk)
+        return packed
+
     def _global_batches_by_dataset(self, rng: random.Random) -> dict[str, list[list[int]]]:
         result = defaultdict(list)
         for key in sorted(self.groups, key=repr):
@@ -647,6 +675,7 @@ class HomogeneousDistributedBatchSampler(Sampler[list[int]]):
             global_batches.extend(selected)
         if self.shuffle:
             rng.shuffle(global_batches)
+        global_batches = self._pack_global_batches_for_accum(global_batches, rng)
         rank_start = self.rank * self.batch_size
         for global_batch in global_batches:
             yield global_batch[rank_start : rank_start + self.batch_size]

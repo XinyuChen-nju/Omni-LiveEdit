@@ -123,77 +123,81 @@ class BerniniEditTeacher(nn.Module):
             x=noisy_bcfhw, t=t_flat, context=context,
             cond_latents=cond_latents, edit_mode=True)
 
-    @torch.no_grad()
-    def predict_real(
+
+    VALID_GUIDANCE_MODES = ("t2v", "v2v", "v2v_apg", "rv2v", "i2i")
+
+    @staticmethod
+    def _to_bcfhw(lat: torch.Tensor) -> torch.Tensor:
+        return lat.permute(0, 2, 1, 3, 4)
+
+    @staticmethod
+    def _slice_context(context, idx):
+        if isinstance(context, torch.Tensor):
+            return context[idx]
+        return [context[i] for i in idx]
+
+    def _build_cond_sets(
         self,
-        noisy_image_or_video: torch.Tensor,    # [B, F, C, H, W]
-        timestep: torch.Tensor,                # [B, F]
-        text_cond: List[torch.Tensor],         # list of [L, text_dim]
-        text_uncond: List[torch.Tensor],
-        source_latents: Optional[List[torch.Tensor]] = None,  # each [B, F, C, H, W]
-        ref_latents: Optional[List[torch.Tensor]] = None,     # each [B, 1, C, H, W]
-        source_timesteps: Optional[List[torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        """Return the guided x0 prediction (pred_real), shape [B, F, C, H, W]."""
-        b, f = noisy_image_or_video.shape[:2]
-        x = noisy_image_or_video.permute(0, 2, 1, 3, 4)        # [B, C, F, H, W]
-
-        def to_bcfhw(lat):
-            return lat.permute(0, 2, 1, 3, 4)
-
-        # Build condition token sets with incrementing source_id (matches Bernini).
+        source_latents,
+        ref_latents,
+        source_timesteps,
+    ):
         vids, refs = source_latents or [], ref_latents or []
         src_ts = source_timesteps or [None] * len(vids)
         if len(src_ts) != len(vids):
             raise ValueError(
-                "source_timesteps must have one entry per source latent"
-            )
+                "source_timesteps must have one entry per source latent")
         sid = 1
         v_cond, vi_cond = [], []
         for v, src_t in zip(vids, src_ts):
-            spec = (to_bcfhw(v), sid, True, src_t)
+            spec = (self._to_bcfhw(v), sid, True, src_t)
             sid += 1
-            v_cond.append(spec); vi_cond.append(spec)
+            v_cond.append(spec)
+            vi_cond.append(spec)
         for r in refs:
-            spec = (to_bcfhw(r), sid, False, None)
+            spec = (self._to_bcfhw(r), sid, False, None)
             sid += 1
             vi_cond.append(spec)
+        return v_cond, vi_cond
 
-        mode = self.guidance_mode
-        use_low = self._uses_low_expert(timestep)
-        scale_mult = self.omega_scale if use_low else 1.0
+    def _predict_real_group(
+        self,
+        noisy_image_or_video: torch.Tensor,
+        timestep: torch.Tensor,
+        text_cond,
+        text_uncond,
+        v_cond,
+        vi_cond,
+        mode: str,
+        use_low: bool,
+        scale_mult: float,
+    ) -> torch.Tensor:
+        b, f = noisy_image_or_video.shape[:2]
+        x = noisy_image_or_video.permute(0, 2, 1, 3, 4)
         omega_v = self.omega_v * scale_mult
         omega_i = self.omega_i * scale_mult
         omega_ti = self.omega_ti * scale_mult
         if mode == "v2v_apg":
-            # Adaptive Projected Guidance, evaluated in x0 space (Bernini's
-            # `v2v_apg`). Non-linear, so it cannot be folded into the flow-space
-            # combination used by the other modes; return the guided x0 directly.
             v_uncond = self._flow(
                 x, timestep, text_uncond, vi_cond, use_low).permute(0, 2, 1, 3, 4)
-            v_cond = self._flow(
+            v_cond_flow = self._flow(
                 x, timestep, text_cond, vi_cond, use_low).permute(0, 2, 1, 3, 4)
             x0_uncond = self._convert_flow_pred_to_x0(
                 v_uncond.flatten(0, 1), noisy_image_or_video.flatten(0, 1),
                 timestep.flatten(0, 1)).unflatten(0, (b, f))
             x0_cond = self._convert_flow_pred_to_x0(
-                v_cond.flatten(0, 1), noisy_image_or_video.flatten(0, 1),
+                v_cond_flow.flatten(0, 1), noisy_image_or_video.flatten(0, 1),
                 timestep.flatten(0, 1)).unflatten(0, (b, f))
             return self._apg(x0_cond, x0_uncond, omega_ti)
-        elif mode in ("v2v", "i2i"):
-            eps_vi = self._flow(
-                x, timestep, text_uncond, vi_cond, use_low)
-            eps_vti = self._flow(
-                x, timestep, text_cond, vi_cond, use_low)
+        if mode in ("v2v", "i2i"):
+            eps_vi = self._flow(x, timestep, text_uncond, vi_cond, use_low)
+            eps_vti = self._flow(x, timestep, text_cond, vi_cond, use_low)
             flow = eps_vi + omega_ti * (eps_vti - eps_vi)
         elif mode == "rv2v":
             eps_0 = self._flow(x, timestep, text_uncond, [], use_low)
-            eps_v = self._flow(
-                x, timestep, text_uncond, v_cond, use_low)
-            eps_vi = self._flow(
-                x, timestep, text_uncond, vi_cond, use_low)
-            eps_vti = self._flow(
-                x, timestep, text_cond, vi_cond, use_low)
+            eps_v = self._flow(x, timestep, text_uncond, v_cond, use_low)
+            eps_vi = self._flow(x, timestep, text_uncond, vi_cond, use_low)
+            eps_vti = self._flow(x, timestep, text_cond, vi_cond, use_low)
             flow = (eps_0
                     + omega_v * (eps_v - eps_0)
                     + omega_i * (eps_vi - eps_v)
@@ -205,11 +209,65 @@ class BerniniEditTeacher(nn.Module):
         else:
             raise ValueError(f"unknown guidance_mode {mode}")
 
-        flow = flow.permute(0, 2, 1, 3, 4)                     # [B, F, C, H, W]
-        x0 = self._convert_flow_pred_to_x0(
-            flow.flatten(0, 1), noisy_image_or_video.flatten(0, 1), timestep.flatten(0, 1)
-        ).unflatten(0, (b, f))
-        return x0
+        flow = flow.permute(0, 2, 1, 3, 4)
+        return self._convert_flow_pred_to_x0(
+            flow.flatten(0, 1), noisy_image_or_video.flatten(0, 1),
+            timestep.flatten(0, 1)).unflatten(0, (b, f))
+
+    @torch.no_grad()
+    def predict_real(
+        self,
+        noisy_image_or_video: torch.Tensor,
+        timestep: torch.Tensor,
+        text_cond,
+        text_uncond,
+        source_latents: Optional[List[torch.Tensor]] = None,
+        ref_latents: Optional[List[torch.Tensor]] = None,
+        source_timesteps: Optional[List[torch.Tensor]] = None,
+        guidance_modes: Optional[List[str]] = None,
+    ) -> torch.Tensor:
+        """Return guided x0 (pred_real). Supports per-sample guidance_modes."""
+        b = noisy_image_or_video.shape[0]
+        if guidance_modes is None:
+            modes = [self.guidance_mode] * b
+        else:
+            if len(guidance_modes) != b:
+                raise ValueError(
+                    f"guidance_modes length {len(guidance_modes)} != batch {b}")
+            modes = [str(m).strip().lower() for m in guidance_modes]
+
+        use_low = self._uses_low_expert(timestep)
+        scale_mult = self.omega_scale if use_low else 1.0
+
+        unique = set(modes)
+        if len(unique) == 1:
+            v_cond, vi_cond = self._build_cond_sets(
+                source_latents, ref_latents, source_timesteps)
+            return self._predict_real_group(
+                noisy_image_or_video, timestep, text_cond, text_uncond,
+                v_cond, vi_cond, modes[0], use_low, scale_mult)
+
+        out = torch.empty_like(noisy_image_or_video)
+        for mode in unique:
+            idx = [i for i, m in enumerate(modes) if m == mode]
+            noisy_g = noisy_image_or_video[idx]
+            t_g = timestep[idx]
+            tc_g = self._slice_context(text_cond, idx)
+            tu_g = self._slice_context(text_uncond, idx)
+            src_g = ([s[idx] for s in source_latents]
+                     if source_latents else None)
+            ref_g = ([r[idx] for r in ref_latents]
+                     if ref_latents else None)
+            st_g = ([st[idx] for st in source_timesteps]
+                    if source_timesteps else None)
+            v_cond, vi_cond = self._build_cond_sets(src_g, ref_g, st_g)
+            pred_g = self._predict_real_group(
+                noisy_g, t_g, tc_g, tu_g, v_cond, vi_cond,
+                mode, use_low, scale_mult)
+            for j, i in enumerate(idx):
+                out[i] = pred_g[j]
+        return out
+
 
     def _apg(self, pred_cond: torch.Tensor, pred_uncond: torch.Tensor,
              scale: float) -> torch.Tensor:

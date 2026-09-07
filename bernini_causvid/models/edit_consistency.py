@@ -141,6 +141,22 @@ class EditNaiveConsistency(nn.Module):
     def _cond_arg(self, clean):
         return clean if self.teacher_forcing else None
 
+    @staticmethod
+    def _share_edit_block_mask(source_wrapper, target_wrapper):
+        """Reuse an identical causal BlockMask across teacher/student/EMA wrappers."""
+        source_module = getattr(source_wrapper, "module", source_wrapper)
+        target_module = getattr(target_wrapper, "module", target_wrapper)
+        source_model = getattr(source_module, "model", None)
+        target_model = getattr(target_module, "model", None)
+        if source_model is None or target_model is None:
+            raise RuntimeError("cannot access edit backbone for BlockMask sharing")
+        mask = getattr(source_model, "_edit_block_mask", None)
+        key = getattr(source_model, "_edit_block_mask_key", None)
+        if mask is None or key is None:
+            raise RuntimeError("source edit backbone has no cached BlockMask to share")
+        target_model._edit_block_mask = mask
+        target_model._edit_block_mask_key = key
+
     def generator_loss(
         self,
         conditional_dict: dict,
@@ -174,7 +190,11 @@ class EditNaiveConsistency(nn.Module):
             dt = ((timestep - timestep_next) / 1000.0).reshape(b, f, 1, 1, 1)
             latent_t_next = latent_t - dt * v_pred
 
+        # All three causal wrappers use the same shape/key. Reuse the teacher's
+        # sparse BlockMask instead of materializing the same large dense mask again.
+        self._share_edit_block_mask(self.teacher, self.generator)
         _, cm_pred_t = self.generator(latent_t, conditional_t, timestep, clean_x=self._cond_arg(clean))
+        self._share_edit_block_mask(self.generator, self.generator_ema)
         with torch.no_grad():
             _, cm_pred_t_next = self.generator_ema(
                 latent_t_next, conditional_t_next, timestep_next, clean_x=self._cond_arg(clean))

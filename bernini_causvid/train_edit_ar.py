@@ -325,6 +325,7 @@ def main():
         edit_collate,
         distributed,
         dataset_sampling_weights=getattr(cfg, "dataset_sampling_weights", None),
+        gradient_accumulation_steps=grad_accum,
     )
     data = cycle(loader)
     if hasattr(loader.batch_sampler, "dataset_batch_counts"):

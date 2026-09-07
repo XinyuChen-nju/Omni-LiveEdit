@@ -35,6 +35,12 @@ score_causal_source: false             # 双向 score 可见完整 source
 
 # ---- Bernini real-score guidance ------------------------------------------
 guidance_mode: v2v_apg
+guidance_mode_by_task_type:
+  t2v: t2v
+  s2v: v2v_apg
+  v2v: v2v_apg
+  i2i: v2v_apg
+  rv2v: rv2v
 guidance_scale: 3.0
 omega_v: 1.25                     # 视频条件分支引导权重
 omega_i: 4.5                      # 图像 / source 条件分支引导权重

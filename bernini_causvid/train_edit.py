@@ -345,7 +345,7 @@ def main():
     # load_target=True 仅用于进度采样的 source/target 参考视频和 latent MSE；
     # DMD 训练损失本身不会读取 target_latent。
     dataset = EditLatentDataset(cfg.data_path, load_target=True)
-    loader = D.make_loader(dataset, cfg.batch_size, edit_collate, distributed)
+    loader = D.make_loader(dataset, cfg.batch_size, edit_collate, distributed, gradient_accumulation_steps=grad_accum)
     data = cycle(loader)
     log(f"[train] dataset size {len(dataset)} | grad_accum {grad_accum} | global batch "
         f"{cfg.batch_size * dist_info['world_size'] * grad_accum} "
@@ -403,6 +403,8 @@ def main():
             cond["ref_latents"] = [
                 ref.to(device, dtype) for ref in batch["ref_latents"]
             ]
+        if "task_types" in batch:
+            cond["task_types"] = list(batch["task_types"])
         uncond = {
             "prompt_embeds": uncond_cache["prompt_embeds"].expand(
                 b, -1, -1

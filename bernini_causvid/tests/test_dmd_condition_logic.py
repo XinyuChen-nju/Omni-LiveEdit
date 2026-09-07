@@ -122,6 +122,54 @@ def test_dual_teacher_uses_one_timestep_per_batch():
     print("[ok] dual teacher receives one synchronized expert timestep")
 
 
+
+def test_resolve_guidance_modes_by_task_type():
+    model = EditDMD.__new__(EditDMD)
+    torch.nn.Module.__init__(model)
+    model.default_guidance_mode = "v2v_apg"
+    model.guidance_mode_by_task_type = {
+        "t2v": "t2v",
+        "rv2v": "rv2v",
+    }
+    modes = model._resolve_guidance_modes(["t2v", "rv2v", "v2v", ""])
+    assert modes == ["t2v", "rv2v", "v2v_apg", "v2v_apg"]
+    print("[ok] guidance modes resolve from task_type map")
+
+
+def test_teacher_mixed_guidance_mode_groups_batch():
+    teacher = BerniniEditTeacher.__new__(BerniniEditTeacher)
+    torch.nn.Module.__init__(teacher)
+    teacher.guidance_mode = "v2v_apg"
+    teacher.omega_v = 1.0
+    teacher.omega_i = 1.0
+    teacher.omega_ti = 1.0
+    teacher.omega_scale = 1.0
+    teacher.is_dual_expert = False
+    teacher._uses_low_expert = lambda _t: False
+
+    calls = []
+
+    def fake_group(noisy, timestep, text_cond, text_uncond,
+                   v_cond, vi_cond, mode, use_low, scale_mult):
+        calls.append(mode)
+        return torch.full_like(noisy, {"t2v": 1.0, "rv2v": 2.0, "v2v_apg": 3.0}[mode])
+
+    teacher._build_cond_sets = lambda *_a, **_k: ([], [])
+    teacher._predict_real_group = fake_group
+
+    noisy = torch.zeros(3, 2, 4, 1, 1)
+    out = teacher.predict_real(
+        noisy, torch.zeros(3, 2),
+        text_cond=torch.zeros(3, 1, 1),
+        text_uncond=torch.zeros(3, 1, 1),
+        guidance_modes=["t2v", "rv2v", "v2v_apg"],
+    )
+    assert set(calls) == {"t2v", "rv2v", "v2v_apg"}
+    assert out[0, 0, 0, 0, 0].item() == 1.0
+    assert out[1, 0, 0, 0, 0].item() == 2.0
+    assert out[2, 0, 0, 0, 0].item() == 3.0
+    print("[ok] mixed guidance_modes dispatch per sample")
+
 if __name__ == "__main__":
     test_score_source_uses_target_timestep()
     test_score_source_fixed_mode_is_clean()
@@ -129,4 +177,6 @@ if __name__ == "__main__":
     test_dual_teacher_routes_by_timestep()
     test_dual_teacher_rejects_mixed_expert_batch()
     test_dual_teacher_uses_one_timestep_per_batch()
+    test_resolve_guidance_modes_by_task_type()
+    test_teacher_mixed_guidance_mode_groups_batch()
     print("ALL PASS")

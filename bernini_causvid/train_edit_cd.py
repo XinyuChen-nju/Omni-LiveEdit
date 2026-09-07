@@ -82,6 +82,30 @@ def select_eval_items(items, kinds):
     return picked
 
 
+def select_configured_eval_items(items, specs):
+    """Select fixed evaluation samples using exact metadata filters."""
+    selected = []
+    for raw_spec in specs:
+        spec = (OmegaConf.to_container(raw_spec, resolve=True)
+                if OmegaConf.is_config(raw_spec) else dict(raw_spec))
+        name = str(spec.pop("name", "")).strip()
+        count = int(spec.pop("count", 1))
+        if not name or count < 1 or not spec:
+            raise ValueError("each eval_samples entry needs a name, at least one metadata filter, and count >= 1")
+        filters = {str(k): str(v).strip().lower() for k, v in spec.items()}
+        matches = []
+        for idx, item in enumerate(items):
+            if all(str(item.get(k, "")).strip().lower() == v for k, v in filters.items()):
+                matches.append(idx)
+                if len(matches) == count: break
+        if len(matches) != count:
+            raise ValueError(f"eval_samples '{name}' matched {len(matches)}/{count} items for filters {filters}")
+        for sample_no, idx in enumerate(matches, 1):
+            sample_name = name if count == 1 else f"{name}_{sample_no}"
+            selected.append((sample_name, idx))
+    return selected
+
+
 @torch.no_grad()
 def _decode_latent_to_mp4(model, latent, device, dtype, out_path):
     """把一段干净 latent（源/目标）解码成 mp4，仅供 rank0 写参考视频。"""
@@ -138,12 +162,12 @@ def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_sche
         raise RuntimeError("sampling needs a source or target latent for output shape")
 
     # 同一个评测样本在不同训练 step 使用相同的初始噪声。
-    noise_generator = torch.Generator(device=sample_latent.device)
+    noise_generator = torch.Generator(device=device)
     noise_generator.manual_seed(int(sample_seed))
     noise = torch.randn(
         sample_latent.shape,
-        device=sample_latent.device,
-        dtype=sample_latent.dtype,
+        device=device,
+        dtype=dtype,
         generator=noise_generator,
     )
 
@@ -299,9 +323,20 @@ def main():
     elif step > 0:
         log("[train] checkpoint has no optimizer state -> optimizer starts fresh")
 
-    dataset = EditLatentDataset(cfg.data_path, load_target=True)
-    loader = D.make_loader(dataset, cfg.batch_size, edit_collate, distributed)
+    dataset = EditLatentDataset(
+        cfg.data_path,
+        load_target=True,
+        dataset_max_lat_frames=getattr(cfg, "dataset_max_lat_frames", None),
+    )
+    loader = D.make_loader(
+        dataset, cfg.batch_size, edit_collate, distributed,
+        dataset_sampling_weights=getattr(cfg, "dataset_sampling_weights", None),
+        gradient_accumulation_steps=grad_accum,
+    )
     data = cycle(loader)
+    if hasattr(loader.batch_sampler, "dataset_batch_counts"):
+        log("[train] dataset batches per epoch "
+            + str(dict(sorted(loader.batch_sampler.dataset_batch_counts.items()))))
     log(f"[train] dataset size {len(dataset)} | grad_accum {grad_accum} | global batch "
         f"{cfg.batch_size * dist_info['world_size'] * grad_accum} "
         f"(per-gpu micro-batch {cfg.batch_size} x world {dist_info['world_size']} x accum {grad_accum})")
@@ -360,29 +395,45 @@ def main():
         return cond, uncond
 
     image_or_video_shape = list(cfg.image_or_video_shape)
-    # 固定的评测样本，使各步进度视频可纵向比较；每种编辑类型（增/删/改）各取一条。
-    kinds = [k for k, _ in EDIT_KINDS]
-    picked = select_eval_items(dataset.items, kinds)
+    configured_eval = getattr(cfg, "eval_samples", None)
     eval_specs = []
-    for kind in kinds:
-        indices = picked.get(kind, [])
-        if not indices:
-            log(f"[train] WARN: no '{kind}' sample found in dataset, skipping it")
-            continue
+    if configured_eval:
+        selected = select_configured_eval_items(dataset.items, configured_eval)
+        available_tasks = {str(item.get("task_type", "")).strip().lower()
+                           for item in dataset.items if item.get("task_type")}
+        covered_tasks = {str(dataset.items[idx].get("task_type", "")).strip().lower()
+                         for _name, idx in selected}
+        missing_tasks = sorted(available_tasks - covered_tasks)
+        if missing_tasks:
+            raise ValueError("eval_samples does not cover dataset task types: "
+                             + ", ".join(missing_tasks))
+        for name, idx in selected:
+            eval_specs.append((name, idx, edit_collate([dataset[idx]])))
+    else:
+        kinds = [k for k, _ in EDIT_KINDS]
+        picked = select_eval_items(dataset.items, kinds)
+        for kind in kinds:
+            indices = picked.get(kind, [])
+            if not indices:
+                log(f"[train] WARN: no '{kind}' sample found in dataset, skipping it")
+                continue
+            for n, idx in enumerate(indices, 1):
+                eval_specs.append((f"{kind}_{n}", idx, edit_collate([dataset[idx]])))
+        if not eval_specs:
+            eval_specs.append(("sample", 0, edit_collate([dataset[0]])))
 
-        for n, idx in enumerate(indices, 1):
-            name = f"{kind}_{n}"
-            eval_specs.append(
-                (name, idx, edit_collate([dataset[idx]]))
-            )
-    if not eval_specs:
-        eval_specs.append(("sample", 0, edit_collate([dataset[0]])))
 
     if is_main:
         meta = {"data_path": cfg.data_path, "samples": {}}
         for kind, idx, eb in eval_specs:
-            meta["samples"][kind] = {"index": idx,
-                                     "prompt": dataset.items[idx].get("prompt", "")}
+            meta["samples"][kind] = {
+                "index": idx,
+                "dataset": dataset.items[idx].get("dataset", ""),
+                "task_type": dataset.items[idx].get("task_type", ""),
+                "edit_type": dataset.items[idx].get("edit_type", ""),
+                "prompt": dataset.items[idx].get("prompt", ""),
+            }
+
             try:
                 if "source_latent" in eb:
                     _decode_latent_to_mp4(

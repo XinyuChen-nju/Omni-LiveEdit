@@ -105,10 +105,15 @@ class EditDiffusion(nn.Module):
 
     # per-block timestep indices (same block shares a noise level), like base._get_timestep.
     def _sample_timestep_index(self, b, f, lo, hi):
-        idx = torch.randint(int(lo), int(hi), (b, f), device=self.device, dtype=torch.long)
-        idx = idx.reshape(b, -1, self.num_frame_per_block)
-        idx[:, :, 1:] = idx[:, :, 0:1]
-        return idx.reshape(b, f)
+        # Sample once per temporal block, then trim the final partial block.
+        # Unified training includes single-frame images and variable-length videos,
+        # so ``f`` is not necessarily divisible by ``num_frame_per_block``.
+        block = self.num_frame_per_block
+        num_blocks = (f + block - 1) // block
+        idx = torch.randint(
+            int(lo), int(hi), (b, num_blocks), device=self.device, dtype=torch.long
+        )
+        return idx.repeat_interleave(block, dim=1)[:, :f]
 
     # per-frame timestep VALUE in [0, hi] (inclusive), shared within a block. Used for
     # the "slight noise" augmentations (clean context / source): a small `hi` means a
@@ -116,10 +121,10 @@ class EditDiffusion(nn.Module):
     # and 0 is included so the clean case stays in-distribution. Same value-space
     # convention as inference's context_noise / source_noise.
     def _sample_timestep_value(self, b, f, hi):
-        v = torch.randint(0, int(hi) + 1, (b, f), device=self.device)
-        v = v.reshape(b, -1, self.num_frame_per_block)
-        v[:, :, 1:] = v[:, :, 0:1]
-        return v.reshape(b, f).to(self.dtype)
+        block = self.num_frame_per_block
+        num_blocks = (f + block - 1) // block
+        v = torch.randint(0, int(hi) + 1, (b, num_blocks), device=self.device)
+        return v.repeat_interleave(block, dim=1)[:, :f].to(self.dtype)
 
     @torch.no_grad()
     def _edit_region_mask(self, source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

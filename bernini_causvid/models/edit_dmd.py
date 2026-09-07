@@ -102,6 +102,14 @@ class EditDMD(nn.Module):
             apg_norm_threshold=getattr(config, "apg_norm_threshold", 50.0))
         self.real_score.requires_grad_(False)
 
+        self.default_guidance_mode = str(
+            getattr(config, "guidance_mode", "v2v_apg")).strip().lower()
+        raw_mode_map = getattr(config, "guidance_mode_by_task_type", None) or {}
+        self.guidance_mode_by_task_type = {
+            str(k).strip().lower(): str(v).strip().lower()
+            for k, v in raw_mode_map.items()
+        }
+
         # Full ReCo indexes already carry precomputed prompt embeddings. Matching
         # Stage 1/2, skip constructing umT5 entirely in that mode (~11 GB/rank
         # plus an expensive FSDP all-gather during startup).
@@ -206,6 +214,15 @@ class EditDMD(nn.Module):
         ts = ts.repeat(b if synchronize else 1, f)
         return self._shift_ts(ts)
 
+    def _resolve_guidance_modes(self, task_types):
+        modes = []
+        for task in task_types:
+            key = str(task or "").strip().lower()
+            mode = self.guidance_mode_by_task_type.get(
+                key, self.default_guidance_mode)
+            modes.append(mode)
+        return modes
+
     def _split_cond(self, conditional_dict):
         """Return source_latents / ref_latents lists for the teacher API."""
         src = conditional_dict.get("source_latents", None)
@@ -254,12 +271,17 @@ class EditDMD(nn.Module):
 
         # real score (teacher): chained multi-condition guided x0
         src, ref = self._split_cond(score_cond)
+        task_types = conditional_dict.get("task_types")
+        guidance_modes = (
+            self._resolve_guidance_modes(task_types)
+            if task_types is not None else None)
         pred_real = self.real_score.predict_real(
             noisy_image_or_video=noisy, timestep=timestep,
             text_cond=conditional_dict["prompt_embeds"],
             text_uncond=unconditional_dict["prompt_embeds"],
             source_latents=src, ref_latents=ref,
-            source_timesteps=score_cond.get("source_timesteps"))
+            source_timesteps=score_cond.get("source_timesteps"),
+            guidance_modes=guidance_modes)
 
         grad = pred_fake - pred_real
         if normalization:

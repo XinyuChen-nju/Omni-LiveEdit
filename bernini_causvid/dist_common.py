@@ -189,7 +189,8 @@ def load_optim_state_dict(model: torch.nn.Module, optim: torch.optim.Optimizer,
 
 
 def make_loader(dataset, batch_size, collate_fn, distributed: bool,
-                num_workers: int = 4, dataset_sampling_weights=None):
+                num_workers: int = 4, dataset_sampling_weights=None,
+                gradient_accumulation_steps: int = 1):
     """Build a loader, preserving task/shape homogeneity for unified edit data."""
     if getattr(dataset, "homogeneous_batches", False):
         from bernini_causvid.data.edit_dataset import (
@@ -205,6 +206,7 @@ def make_loader(dataset, batch_size, collate_fn, distributed: bool,
             rank=rank,
             shuffle=True,
             dataset_sampling_weights=dataset_sampling_weights,
+            gradient_accumulation_steps=gradient_accumulation_steps,
         )
         return torch.utils.data.DataLoader(
             dataset,

@@ -55,8 +55,9 @@ class EditCausalInferencePipeline(torch.nn.Module):
         b, num_frames, c, h, w = noise.shape
         device, dtype = noise.device, noise.dtype
         nfpb = self.num_frame_per_block
-        assert num_frames % nfpb == 0
-        num_blocks = num_frames // nfpb
+        if nfpb < 1:
+            raise ValueError(f"num_frame_per_block must be >= 1, got {nfpb}")
+        num_blocks = (num_frames + nfpb - 1) // nfpb
 
         frame_seq = edit_frame_seq(self.generator, h, w)
         source, refs = get_source_refs(conditional_dict)
@@ -75,7 +76,9 @@ class EditCausalInferencePipeline(torch.nn.Module):
 
         for blk in tqdm.tqdm(range(num_blocks)):
             fs = blk * nfpb
-            sl = slice(fs, fs + nfpb)
+            fe = min(fs + nfpb, num_frames)
+            sl = slice(fs, fe)
+            block_frames = fe - fs
             cur_cond_start = ref_tokens + fs * frame_seq
             cur_tgt_start = fs * frame_seq
 
@@ -102,7 +105,9 @@ class EditCausalInferencePipeline(torch.nn.Module):
                         nfpb, blk, float(ts.item()))
                 if attn_rec is not None:
                     attn_rec.set_context(block=blk, step=i, is_refresh=False)
-                timestep = torch.full([b, nfpb], float(ts.item()), device=device, dtype=torch.float32)
+                timestep = torch.full(
+                    [b, block_frames], float(ts.item()),
+                    device=device, dtype=torch.float32)
                 _, denoised = self.generator(
                     stream_mode="denoise_target",
                     noisy_image_or_video=noisy, timestep=timestep,
@@ -121,15 +126,17 @@ class EditCausalInferencePipeline(torch.nn.Module):
                     noisy = self.scheduler.add_noise(
                         denoised.flatten(0, 1),
                         transition_noise.flatten(0, 1),
-                        torch.full([b * nfpb], nts, device=device, dtype=torch.float32),
-                    ).unflatten(0, (b, nfpb))
+                        torch.full([b * block_frames], nts, device=device, dtype=torch.float32),
+                    ).unflatten(0, (b, block_frames))
 
             output[:, sl] = denoised
 
             # 3) refresh TARGET block N clean K/V in the cache (context_noise)
             if attn_rec is not None:
                 attn_rec.set_context(block=blk, step=len(denoise_list), is_refresh=True)
-            ctx_t = torch.full([b, nfpb], float(self.context_noise), device=device, dtype=torch.float32)
+            ctx_t = torch.full(
+                [b, block_frames], float(self.context_noise),
+                device=device, dtype=torch.float32)
             self.generator(
                 stream_mode="denoise_target",
                 noisy_image_or_video=denoised, timestep=ctx_t,

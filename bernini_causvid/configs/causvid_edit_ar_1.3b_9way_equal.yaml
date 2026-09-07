@@ -1,0 +1,111 @@
+# Stage 1 AR: nine datasets sampled equally (1:1:1:1:1:1:1:1:1).
+# Sources: OpenVid, ReCo, OpenVE, UniEdit, Pico-Banana, FitVTO, Ref6M, Eevee, TripVVT.
+model_name: Bernini-R-1.3B
+model_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Bernini-R-1.3B-Wan
+text_encoder_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+vae_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+
+causal: true
+num_frame_per_block: 3
+timestep_shift: 5.0
+cache_text_embeds: true
+
+dataset_max_lat_frames:
+  openvid_t2v: 21
+  reco: 21
+  openve_3m_60k: 21
+  uniredit_data_100k: 1
+  pico_banana_400k_single_sft_100k: 1
+  fitvto_100k: 1
+  ref6m_tryon: 1
+  eevee: 21
+  tripvvt: 21
+
+teacher_forcing: true
+noise_augmentation_max_timestep: 100
+source_noise_max_timestep: 100
+source_timestep_mode: source
+num_train_timestep: 1000
+denoising_loss_type: flow
+
+region_loss: true
+region_edit_weight: 2.0
+region_mask_threshold: 0.10
+region_mask_soft: false
+region_weight_normalize: true
+region_loss_by_type:
+  add: true
+  remove: true
+  replace: true
+  tryon: true
+  convert: false
+  style: false
+  generate: false
+  animate: false
+  motion_transfer: false
+
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+mixed_precision: true
+gradient_checkpointing: true
+batch_size: 1
+gradient_accumulation_steps: 2
+lr: 5.0e-06
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.0
+ema_weight: 0.0
+ema_start_step: 0
+seed: 0
+sharding_strategy: grad_op
+
+data_path: /opt/dlami/nvme/chenxinyu/data/Universal-Edit-Metadata/mixed_train/index_ar_9way_equal_openvid_reco_openve_unir_pico_fit_ref6m_eevee_vvt.json
+
+# Arbitrary positive weights are normalized by HomogeneousDistributedBatchSampler.
+dataset_sampling_weights:
+  openvid_t2v: 1.0
+  reco: 1.0
+  openve_3m_60k: 1.0
+  uniredit_data_100k: 1.0
+  pico_banana_400k_single_sft_100k: 1.0
+  fitvto_100k: 1.0
+  ref6m_tryon: 1.0
+  eevee: 1.0
+  tripvvt: 1.0
+
+eval_samples:
+- name: openvid_t2v
+  dataset: openvid_t2v
+  task_type: t2v
+- name: reco_v2v
+  dataset: reco
+  task_type: v2v
+- name: openve_v2v
+  dataset: openve_3m_60k
+  task_type: v2v
+- name: uniredit_image
+  dataset: uniredit_data_100k
+  task_type: v2v
+- name: pico_image
+  dataset: pico_banana_400k_single_sft_100k
+  task_type: v2v
+- name: fitvto_tryon
+  dataset: fitvto_100k
+  task_type: rv2v
+- name: ref6m_tryon
+  dataset: ref6m_tryon
+  task_type: rv2v
+- name: eevee_tryon
+  dataset: eevee
+  task_type: rv2v
+- name: tripvvt_tryon
+  dataset: tripvvt
+  task_type: rv2v
+
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
