@@ -26,7 +26,42 @@ from omegaconf import OmegaConf
 
 from bernini_causvid.models.edit_wrapper import EditDiffusionWrapper
 from bernini_causvid.pipeline.edit_causal_inference import EditCausalInferencePipeline
+from bernini_causvid.pipeline.edit_stream_common import ref_token_count
 from utils.wan_wrapper import WanTextEncoder, WanVAEWrapper
+
+
+def resize_ref_pixels(pixels: torch.Tensor, max_size: int, stride: int = 16):
+    """Aspect-preserving Bernini-style RGB resize before VAE encoding."""
+    if pixels.ndim != 3:
+        raise ValueError(f"reference pixels must be [C,H,W], got {tuple(pixels.shape)}")
+    if max_size < stride:
+        raise ValueError(f"ref max size must be >= {stride}, got {max_size}")
+
+    import torch.nn.functional as F
+
+    height, width = map(int, pixels.shape[-2:])
+    scale = min(float(max_size) / max(height, width), 1.0)
+
+    def snapped(value):
+        return max(stride, int(round(value / stride)) * stride)
+
+    new_height = snapped(height * scale)
+    new_width = snapped(width * scale)
+    if max(new_height, new_width) > max_size:
+        correction = float(max_size) / max(new_height, new_width)
+        new_height = snapped(new_height * correction)
+        new_width = snapped(new_width * correction)
+
+    batched = pixels.unsqueeze(0)
+    if (new_height, new_width) == (height, width):
+        return batched
+    return F.interpolate(
+        batched,
+        size=(new_height, new_width),
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
+    )
 
 
 def load_video(path, num_frames, size):
@@ -53,6 +88,10 @@ def main():
     ap.add_argument("--num_frames", type=int, default=21)
     ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--width", type=int, default=832)
+    ap.add_argument(
+        "--ref_max_size", type=int, default=None,
+        help="maximum RGB edge for refs; defaults to max(height, width)",
+    )
     ap.add_argument("--fps", type=int, default=16)
     # ---- spatial attention visualization (opt-in) ----------------------
     ap.add_argument("--vis_attn", action="store_true",
@@ -93,14 +132,13 @@ def main():
     cond = dict(text_encoder(text_prompts=[args.prompt]))
     cond["source_latents"] = [source_latent]
     if args.refs:
-        import torch.nn.functional as F
         import imageio.v2 as imageio
         refs = []
+        ref_max_size = args.ref_max_size or max(args.height, args.width)
         for r in args.refs:
             img = imageio.imread(r)
             pi = torch.from_numpy(img[..., :3]).float().permute(2, 0, 1) / 127.5 - 1.0  # [3,H,W]
-            pi = F.interpolate(pi.unsqueeze(0), size=(args.height, args.width),
-                               mode="bilinear", align_corners=False).unsqueeze(2)  # [1,3,1,H,W]
+            pi = resize_ref_pixels(pi, ref_max_size).unsqueeze(2)  # [1,3,1,Hr,Wr]
             refs.append(vae.encode_to_latent(pi.to(device, dtype)).to(dtype))
         cond["ref_latents"] = refs
 
@@ -112,7 +150,7 @@ def main():
         _, _, _, lh, lw = source_latent.shape
         frame_seq = (lh // ph) * (lw // pw)
         h_lat, w_lat = lh // ph, lw // pw
-        ref_tokens = sum(r.shape[1] for r in cond.get("ref_latents", [])) * frame_seq
+        ref_tokens = ref_token_count(gen, cond.get("ref_latents", []))
         if args.attn_layers is not None:
             layers = args.attn_layers
         else:

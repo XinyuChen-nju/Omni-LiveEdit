@@ -23,6 +23,7 @@ import torch.distributed as dist
 
 from .edit_stream_common import (
     alloc_edit_caches, edit_frame_seq, get_source_refs, prefill_refs,
+    ref_token_count,
     refresh_visible_source, SOURCE_SID)
 
 
@@ -72,10 +73,16 @@ class EditSelfForcingTrainingPipeline:
         assert source is not None and source.shape[1] == num_frames, \
             "streamed-causal editing needs a frame-aligned source video"
 
-        ref_tokens = sum(r.shape[1] for r in refs) * frame_seq
+        ref_tokens = ref_token_count(self.generator, refs)
         cond_cache, tgt_cache, crossattn_cache = alloc_edit_caches(
             self.generator, b, frame_seq, num_frames, ref_tokens, dtype, device)
-        prefill_refs(self.generator, conditional_dict, refs, cond_cache, crossattn_cache, frame_seq)
+        written_ref_tokens = prefill_refs(
+            self.generator, conditional_dict, refs, cond_cache, crossattn_cache
+        )
+        if written_ref_tokens != ref_tokens:
+            raise RuntimeError(
+                f"reference cache accounting mismatch: {written_ref_tokens} != {ref_tokens}"
+            )
 
         output = torch.zeros_like(noise)
         denoise_list = self.denoising_step_list.to(device)

@@ -16,7 +16,11 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from bernini_causvid.models.causal_edit_model import EditKVCache, _causal_edit_rope_apply
-from bernini_causvid.pipeline.edit_stream_common import refresh_visible_source
+from bernini_causvid.pipeline.edit_stream_common import (
+    prefill_refs,
+    ref_token_count,
+    refresh_visible_source,
+)
 from wan.modules.causal_model import causal_rope_apply
 from wan.modules.model import rope_params
 
@@ -110,6 +114,37 @@ def test_rope_matches_framework():
     print("[ok] _causal_edit_rope_apply matches framework causal_rope_apply")
 
 
+def test_independent_reference_grids_use_actual_token_counts():
+    class Model:
+        patch_size = (1, 2, 2)
+
+    class RecordingGenerator:
+        def __init__(self):
+            self.model = Model()
+            self.calls = []
+
+        def __call__(self, **kwargs):
+            self.calls.append(kwargs)
+
+    generator = RecordingGenerator()
+    refs = [
+        torch.randn(1, 1, 16, 8, 6),   # 1 * 4 * 3 = 12 tokens
+        torch.randn(1, 2, 16, 10, 4),  # 2 * 5 * 2 = 20 tokens
+    ]
+    assert ref_token_count(generator, refs) == 32
+    written = prefill_refs(
+        generator=generator,
+        conditional_dict={"prompt_embeds": ["unused"]},
+        refs=refs,
+        cond_cache=["cond"],
+        crossattn_cache=["cross"],
+    )
+    assert written == 32
+    assert [c["current_cond_start"] for c in generator.calls] == [0, 12]
+    assert [c["source_id"] for c in generator.calls] == [2, 3]
+    print("[ok] independently-sized refs use their actual patch-token counts")
+
+
 def test_source_cache_refreshes_all_visible_blocks():
     class RecordingGenerator:
         def __init__(self):
@@ -145,5 +180,6 @@ if __name__ == "__main__":
     test_local_rolling_with_sink()
     test_rewrite_from_first_block_truncates_stale_future()
     test_rope_matches_framework()
+    test_independent_reference_grids_use_actual_token_counts()
     test_source_cache_refreshes_all_visible_blocks()
     print("ALL PASS")

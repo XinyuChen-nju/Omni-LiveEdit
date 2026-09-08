@@ -24,6 +24,21 @@ def edit_frame_seq(generator, h, w):
     return (h // ph) * (w // pw)
 
 
+def ref_token_count(generator, refs):
+    """Return the actual patch-token count for independently-sized references."""
+    total = 0
+    for ref in refs:
+        if ref.ndim != 5:
+            raise ValueError(
+                "reference latents must be [B,F,C,H,W], "
+                f"got {tuple(ref.shape)}"
+            )
+        total += int(ref.shape[1]) * edit_frame_seq(
+            generator, int(ref.shape[-2]), int(ref.shape[-1])
+        )
+    return total
+
+
 def get_source_refs(conditional_dict):
     src = conditional_dict.get("source_latents")
     src = src[0] if isinstance(src, list) and src else src
@@ -60,8 +75,7 @@ def alloc_edit_caches(generator, batch_size, frame_seq, num_frames, ref_tokens,
     return cond_cache, tgt_cache, crossattn_cache
 
 
-def prefill_refs(generator, conditional_dict, refs, cond_cache, crossattn_cache,
-                 frame_seq):
+def prefill_refs(generator, conditional_dict, refs, cond_cache, crossattn_cache):
     """Prefill the reference images as the never-evicted condition prefix.
 
     Returns the number of reference tokens written (== the cond-cache sink size)."""
@@ -74,7 +88,9 @@ def prefill_refs(generator, conditional_dict, refs, cond_cache, crossattn_cache,
             cond_kv_cache=cond_cache, crossattn_cache=crossattn_cache,
             current_cond_start=cursor, conditional_dict=conditional_dict,
             cond_timestep=0.0)
-        cursor += r.shape[1] * frame_seq
+        cursor += int(r.shape[1]) * edit_frame_seq(
+            generator, int(r.shape[-2]), int(r.shape[-1])
+        )
         sid += 1
     return cursor
 

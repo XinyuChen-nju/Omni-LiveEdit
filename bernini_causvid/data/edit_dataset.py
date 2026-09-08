@@ -215,14 +215,12 @@ def _resize_latent_spatial(
 
 
 def _align_visual_conditions(output: dict) -> None:
-    """Match source/reference spatial shapes to the generated target geometry."""
+    """Align the frame-matched source to target while preserving ref grids."""
     anchor = output.get("target_latent")
     if anchor is None:
         anchor = output.get("ode_latent")
     if anchor is None:
         anchor = output.get("source_latent")
-    if anchor is None and output.get("ref_latents"):
-        anchor = output["ref_latents"][0]
     if anchor is None:
         return
     spatial_size = tuple(anchor.shape[-2:])
@@ -231,11 +229,9 @@ def _align_visual_conditions(output: dict) -> None:
             output["source_latent"],
             spatial_size,
         )
-    if "ref_latents" in output:
-        output["ref_latents"] = [
-            _resize_latent_spatial(reference, spatial_size)
-            for reference in output["ref_latents"]
-        ]
+    # References are global condition regions with their own patch grids.  They
+    # must keep the aspect ratio/size chosen by RGB preprocessing before VAE
+    # encoding instead of being distorted to the generated target geometry.
 
 
 class EditLatentDataset(Dataset):
