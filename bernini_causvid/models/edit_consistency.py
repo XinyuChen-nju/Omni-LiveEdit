@@ -79,7 +79,34 @@ class EditNaiveConsistency(nn.Module):
                 tokenizer_path=tokenizer_path).requires_grad_(False)
         self.vae = WanVAEWrapper(vae_path=vae_path).requires_grad_(False)
 
-        self.guidance_scale = getattr(config, "guidance_scale", 3.0)
+        self.guidance_scale = float(getattr(config, "guidance_scale", 3.0))
+        self.apg_eta = float(getattr(config, "apg_eta", 0.5))
+        raw_thresholds = getattr(config, "apg_norm_thresholds", getattr(config, "apg_norm_threshold", (50.0, 50.0, 50.0)))
+        if isinstance(raw_thresholds, (int, float)):
+            raw_thresholds = [raw_thresholds] * 3
+        self.apg_norm_thresholds = tuple(float(x) for x in raw_thresholds)
+        if len(self.apg_norm_thresholds) != 3:
+            raise ValueError("apg_norm_thresholds must contain exactly three values")
+        self.omega_v = float(getattr(config, "omega_v", 1.25))
+        self.omega_i = float(getattr(config, "omega_i", 4.5))
+        self.omega_ti = float(getattr(config, "omega_ti", 4.0))
+        raw_mode_map = getattr(config, "guidance_mode_by_task_type", None) or {
+            "t2v": "t2v",
+            "s2v": "v2v_apg",
+            "v2v": "v2v_apg",
+            "tv2v": "v2v_apg",
+            "i2i": "v2v_apg",
+            "rv2v": "rv2v_apg",
+        }
+        self.guidance_mode_by_task_type = {
+            str(k).strip().lower(): str(v).strip().lower() for k, v in dict(raw_mode_map).items()
+        }
+        if "tv2v" not in self.guidance_mode_by_task_type and "v2v" in self.guidance_mode_by_task_type:
+            self.guidance_mode_by_task_type["tv2v"] = self.guidance_mode_by_task_type["v2v"]
+        valid_modes = {"t2v", "v2v_apg", "rv2v_apg"}
+        invalid_modes = sorted(set(self.guidance_mode_by_task_type.values()) - valid_modes)
+        if invalid_modes:
+            raise ValueError(f"unsupported CD guidance modes: {invalid_modes}")
         self.teacher_forcing = getattr(config, "teacher_forcing", True)
         self.source_timestep_mode = str(
             getattr(config, "source_timestep_mode", "source")
@@ -87,6 +114,14 @@ class EditNaiveConsistency(nn.Module):
         if self.source_timestep_mode not in ("source", "target"):
             raise ValueError(
                 "source_timestep_mode must be 'source' or 'target'")
+        self.ref_timestep = float(getattr(config, "ref_timestep", 0) or 0)
+        if abs(self.ref_timestep) > 1e-8:
+            raise ValueError(
+                f"ref_timestep must be 0 for clean ref time embedding, got {self.ref_timestep}")
+        if self.source_timestep_mode != "source":
+            raise ValueError(
+                "source_timestep_mode must be 'source' (clean source time embedding = 0); "
+                f"got {self.source_timestep_mode!r}")
         self.discrete_cd_N = getattr(config, "discrete_cd_N", 48)
         self.scheduler = FlowMatchScheduler(shift=tshift, sigma_min=0.0, extra_one_step=True)
         self.scheduler.set_timesteps(num_inference_steps=self.discrete_cd_N, denoising_strength=1.0)
@@ -110,36 +145,117 @@ class EditNaiveConsistency(nn.Module):
         sources = conditional_dict.get("source_latents")
         if sources is None:
             cond.pop("source_timesteps", None)
-            return cond
-        if not isinstance(sources, (list, tuple)):
-            sources = [sources]
+        else:
+            if not isinstance(sources, (list, tuple)):
+                sources = [sources]
 
-        source_timesteps = []
-        for source in sources:
-            b, f = source.shape[:2]
-            if self.source_timestep_mode == "source":
-                source_t = torch.zeros(
-                    (b, f), device=source.device, dtype=source.dtype)
-            else:
-                source_t = timestep.to(
-                    device=source.device, dtype=source.dtype)
-                if source_t.dim() == 1:
-                    source_t = source_t.view(b, 1)
-                if source_t.shape[0] != b:
-                    raise ValueError(
-                        f"target timestep batch {source_t.shape[0]} != source batch {b}")
-                if source_t.shape[1] == 1 and f > 1:
-                    source_t = source_t.expand(b, f)
-                if tuple(source_t.shape) != (b, f):
-                    raise ValueError(
-                        f"target timestep shape {tuple(source_t.shape)} "
-                        f"does not match source frames {(b, f)}")
-            source_timesteps.append(source_t)
-        cond["source_timesteps"] = source_timesteps
+            source_timesteps = []
+            for source in sources:
+                b, f = source.shape[:2]
+                if self.source_timestep_mode == "source":
+                    source_t = torch.zeros(
+                        (b, f), device=source.device, dtype=source.dtype)
+                else:
+                    source_t = timestep.to(
+                        device=source.device, dtype=source.dtype)
+                    if source_t.dim() == 1:
+                        source_t = source_t.view(b, 1)
+                    if source_t.shape[0] != b:
+                        raise ValueError(
+                            f"target timestep batch {source_t.shape[0]} != source batch {b}")
+                    if source_t.shape[1] == 1 and f > 1:
+                        source_t = source_t.expand(b, f)
+                    if tuple(source_t.shape) != (b, f):
+                        raise ValueError(
+                            f"target timestep shape {tuple(source_t.shape)} "
+                            f"does not match source frames {(b, f)}")
+                source_timesteps.append(source_t)
+            cond["source_timesteps"] = source_timesteps
+
+        refs = conditional_dict.get("ref_latents")
+        if refs is None:
+            cond.pop("ref_timesteps", None)
+        else:
+            refs = refs if isinstance(refs, (list, tuple)) else [refs]
+            cond["ref_timesteps"] = [self.ref_timestep] * len(refs)
         return cond
 
     def _cond_arg(self, clean):
         return clean if self.teacher_forcing else None
+
+    def _resolve_guidance_mode(self, task_types, batch_size: int) -> str:
+        if task_types is None:
+            raise ValueError("CD guidance requires batch task_types")
+        if len(task_types) != batch_size:
+            raise ValueError(
+                f"task_types length {len(task_types)} != batch {batch_size}")
+        keys = []
+        for raw in task_types:
+            key = str(raw or "").strip().lower()
+            if key == "tv2v":
+                key = "v2v"
+            if key == "s2v":
+                raise NotImplementedError(
+                    "s2v guidance is reserved but not implemented in current training scope")
+            keys.append(key)
+        uniq = set(keys)
+        if len(uniq) != 1:
+            raise ValueError(
+                f"CD batch must be homogeneous in task_type, got {sorted(uniq)}")
+        task = keys[0]
+        if task not in self.guidance_mode_by_task_type:
+            raise ValueError(
+                f"no CD guidance_mode for task_type {task!r}; "
+                f"configured={sorted(self.guidance_mode_by_task_type)}")
+        return self.guidance_mode_by_task_type[task]
+
+    @staticmethod
+    def _visual_subset(condition: dict, *, source: bool, refs: bool) -> dict:
+        out = dict(condition)
+        if not source:
+            out.pop("source_latents", None)
+            out.pop("source_timesteps", None)
+        if not refs:
+            out.pop("ref_latents", None)
+        return out
+
+    def _apg_delta(
+        self,
+        pred_cond: torch.Tensor,
+        pred_base: torch.Tensor,
+        norm_threshold: float,
+    ) -> torch.Tensor:
+        """Bernini `_normalize_diff` without cross-denoising-step momentum."""
+        dims = [-1, -2, -4]
+        diff = (pred_cond - pred_base).double()
+        if norm_threshold > 0:
+            diff_norm = diff.norm(p=2, dim=dims, keepdim=True)
+            diff = diff * torch.minimum(
+                torch.ones_like(diff_norm),
+                norm_threshold / (diff_norm + 1e-12),
+            )
+        direction = pred_cond.double()
+        direction = direction / (
+            direction.norm(p=2, dim=dims, keepdim=True) + 1e-12)
+        parallel = (diff * direction).sum(dim=dims, keepdim=True) * direction
+        orthogonal = diff - parallel
+        return (orthogonal + self.apg_eta * parallel).type_as(pred_cond)
+
+    def _apg(self, pred_cond, pred_uncond, scale, norm_threshold):
+        return pred_uncond + scale * self._apg_delta(
+            pred_cond, pred_uncond, norm_threshold)
+
+    def _apg_chain(self, pred_uncond, preds, scales, norm_thresholds):
+        """Bernini chain: each projected delta uses the previous condition."""
+        if not (len(preds) == len(scales) == len(norm_thresholds)):
+            raise ValueError("APG chain predictions, scales, and thresholds must align")
+        result = pred_uncond
+        previous = pred_uncond
+        for pred_cond, scale, threshold in zip(preds, scales, norm_thresholds):
+            result = result + scale * self._apg_delta(
+                pred_cond, previous, threshold)
+            previous = pred_cond
+        return result
 
     @staticmethod
     def _share_edit_block_mask(source_wrapper, target_wrapper):
@@ -182,11 +298,68 @@ class EditNaiveConsistency(nn.Module):
         conditional_t_next = self._condition_at_t(
             conditional_dict, timestep_next)
 
-        # one teacher CFG step from t -> t_next.
+        # One type-routed teacher guidance step from t -> t_next. Bernini APG
+        # is non-linear, so APG branches are combined in x0 space and converted
+        # back to flow before applying the existing Euler update.
+        guidance_mode = self._resolve_guidance_mode(
+            conditional_dict.get("task_types"), b)
         with torch.no_grad():
-            v_cond, _ = self.teacher(latent_t, conditional_t, timestep, clean_x=self._cond_arg(clean))
-            v_uncond, _ = self.teacher(latent_t, unconditional_t, timestep, clean_x=self._cond_arg(clean))
-            v_pred = v_uncond + self.guidance_scale * (v_cond - v_uncond)
+            if guidance_mode == "t2v":
+                v_cond, _ = self.teacher(
+                    latent_t, conditional_t, timestep,
+                    clean_x=self._cond_arg(clean))
+                v_uncond, _ = self.teacher(
+                    latent_t, unconditional_t, timestep,
+                    clean_x=self._cond_arg(clean))
+                v_pred = v_uncond + self.guidance_scale * (v_cond - v_uncond)
+            elif guidance_mode == "v2v_apg":
+                _, x0_cond = self.teacher(
+                    latent_t, conditional_t, timestep,
+                    clean_x=self._cond_arg(clean))
+                _, x0_uncond = self.teacher(
+                    latent_t, unconditional_t, timestep,
+                    clean_x=self._cond_arg(clean))
+                x0_guided = self._apg(
+                    x0_cond, x0_uncond, self.guidance_scale,
+                    self.apg_norm_thresholds[-1])
+                v_pred = EditDiffusionWrapper._convert_x0_to_flow_pred(
+                    self.scheduler, x0_guided.flatten(0, 1),
+                    latent_t.flatten(0, 1), timestep.flatten(0, 1),
+                ).unflatten(0, (b, f))
+            elif guidance_mode == "rv2v_apg":
+                if not conditional_t.get("source_latents"):
+                    raise ValueError("rv2v_apg requires source_latents")
+                if not conditional_t.get("ref_latents"):
+                    raise ValueError("rv2v_apg requires ref_latents")
+                cond_0 = self._visual_subset(
+                    unconditional_t, source=False, refs=False)
+                cond_v = self._visual_subset(
+                    unconditional_t, source=True, refs=False)
+                cond_vi = self._visual_subset(
+                    unconditional_t, source=True, refs=True)
+                _, x0_0 = self.teacher(
+                    latent_t, cond_0, timestep,
+                    clean_x=self._cond_arg(clean))
+                _, x0_v = self.teacher(
+                    latent_t, cond_v, timestep,
+                    clean_x=self._cond_arg(clean))
+                _, x0_vi = self.teacher(
+                    latent_t, cond_vi, timestep,
+                    clean_x=self._cond_arg(clean))
+                _, x0_vti = self.teacher(
+                    latent_t, conditional_t, timestep,
+                    clean_x=self._cond_arg(clean))
+                x0_guided = self._apg_chain(
+                    x0_0, (x0_v, x0_vi, x0_vti),
+                    (self.omega_v, self.omega_i, self.omega_ti),
+                    self.apg_norm_thresholds)
+                v_pred = EditDiffusionWrapper._convert_x0_to_flow_pred(
+                    self.scheduler, x0_guided.flatten(0, 1),
+                    latent_t.flatten(0, 1), timestep.flatten(0, 1),
+                ).unflatten(0, (b, f))
+            else:
+                raise RuntimeError(f"unreachable guidance_mode {guidance_mode!r}")
+
             dt = ((timestep - timestep_next) / 1000.0).reshape(b, f, 1, 1, 1)
             latent_t_next = latent_t - dt * v_pred
 

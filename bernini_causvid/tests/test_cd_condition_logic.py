@@ -63,8 +63,19 @@ def test_target_mode_rejects_frame_mismatch():
         raise AssertionError("frame mismatch must raise ValueError")
 
 
+def test_rv2v_visual_subset_is_instance_callable():
+    model = _bare_cd("target")
+    cond = _condition()
+    cond["ref_latents"] = [torch.randn(2, 1, 2, 1, 1)]
+    visual = model._visual_subset(cond, source=True, refs=False)
+    assert "source_latents" in visual
+    assert "ref_latents" not in visual
+    assert "ref_latents" in cond
+
+
 if __name__ == "__main__":
     test_target_mode_tracks_each_model_timestep()
     test_source_mode_uses_clean_timestep_zero()
     test_target_mode_rejects_frame_mismatch()
+    test_rv2v_visual_subset_is_instance_callable()
     print("ALL PASS")

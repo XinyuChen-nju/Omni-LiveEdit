@@ -33,6 +33,13 @@ from bernini_causvid.models.edit_consistency import EditNaiveConsistency
 from bernini_causvid.pipeline.edit_causal_inference import EditCausalInferencePipeline
 from bernini_causvid.data.edit_dataset import EditLatentDataset, edit_collate
 from bernini_causvid.train_common import Logger, append_jsonl, find_latest
+from bernini_causvid.train_state import (
+    RESUME_CONTRACT,
+    atomic_torch_save,
+    capture_rng_state,
+    restore_rng_state,
+    stable_sample_seed,
+)
 from bernini_causvid import dist_common as D
 from utils.dataset import cycle
 from utils.scheduler import FlowMatchScheduler
@@ -60,7 +67,15 @@ def load_or_make_neg_embed(cfg, device, is_main):
             tokenizer_path=getattr(cfg, "tokenizer_path", None)).to(device).eval()
         with torch.no_grad():
             emb = te(text_prompts=[cfg.negative_prompt])["prompt_embeds"][0]  # [L, D]
-        torch.save(emb.to(torch.bfloat16).contiguous().cpu(), neg_path)
+        from bernini_causvid.train_state import atomic_torch_save
+        # atomic_torch_save expects a directory checkpoint layout; for a single
+        # tensor file use temp+replace instead.
+        import os as _os
+        tmp_path = neg_path + ".tmp"
+        torch.save(emb.to(torch.bfloat16).contiguous().cpu(), tmp_path)
+        with open(tmp_path, "rb") as _fh:
+            _os.fsync(_fh.fileno())
+        _os.replace(tmp_path, neg_path)
         del te
         torch.cuda.empty_cache()
     D.barrier()
@@ -175,6 +190,7 @@ def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_sche
         noise=noise,
         conditional_dict=cond,
         return_latents=True,
+        rng=noise_generator,
     )
     if not is_main:
         return None
@@ -282,6 +298,7 @@ def main():
     # ---- resume: load weights into the RAW modules BEFORE FSDP shards them --
     # (optimizer state is restored AFTER the optimizer is built, see below)
     step, resume_optim_sd = 0, None
+    pending_sampler_state = None
     if args.resume:
         path = find_latest(ckpt_dir)[0] if args.resume == "auto" else args.resume
         if path and os.path.exists(path):
@@ -293,6 +310,13 @@ def main():
             step = int(sd.get("step", 0))
             resume_optim_sd = sd.get("optimizer")
             log(f"[train] resumed from {path} at step {step}")
+            if sd.get("resume_contract") == RESUME_CONTRACT:
+                if "rng_state" in sd:
+                    restore_rng_state(sd["rng_state"])
+                pending_sampler_state = sd.get("sampler_state")
+            else:
+                log("[train] legacy checkpoint: approximate resume (missing rng/sampler contract)")
+                pending_sampler_state = None
 
     if distributed:
         # generator is trainable -> fp32 master; the EMA twin must be wrapped
@@ -334,6 +358,9 @@ def main():
         gradient_accumulation_steps=grad_accum,
     )
     data = cycle(loader)
+    if pending_sampler_state is not None and hasattr(loader, "batch_sampler") and hasattr(loader.batch_sampler, "load_state_dict"):
+        loader.batch_sampler.load_state_dict(pending_sampler_state)
+        log("[train] restored sampler_state from checkpoint")
     if hasattr(loader.batch_sampler, "dataset_batch_counts"):
         log("[train] dataset batches per epoch "
             + str(dict(sorted(loader.batch_sampler.dataset_batch_counts.items()))))
@@ -391,6 +418,11 @@ def main():
             uncond["source_latents"] = cond["source_latents"]
         if "ref_latents" in cond:
             uncond["ref_latents"] = cond["ref_latents"]
+
+        task_types = batch.get("task_types")
+        if task_types is None:
+            raise ValueError("CD batches must provide task_types for guidance routing")
+        cond["task_types"] = list(task_types)
 
         return cond, uncond
 
@@ -506,9 +538,13 @@ def main():
             if is_main:
                 d = os.path.join(ckpt_dir, f"checkpoint_model_{step:06d}")
                 os.makedirs(d, exist_ok=True)
-                torch.save({"generator": gen_sd, "generator_ema": ema_sd,
-                            "optimizer": optim_sd, "step": step},
-                           os.path.join(d, "model.pt"))
+                _save = {"generator": gen_sd, "generator_ema": ema_sd,
+                         "optimizer": optim_sd, "step": step,
+                         "resume_contract": RESUME_CONTRACT,
+                         "rng_state": capture_rng_state(device)}
+                if hasattr(loader, "batch_sampler") and hasattr(loader.batch_sampler, "state_dict"):
+                    _save["sampler_state"] = loader.batch_sampler.state_dict()
+                atomic_torch_save(_save, os.path.join(d, "model.pt"), extra_meta={"step": int(step)})
                 log(f"[train] saved {d}/model.pt (+optim+ema)")
             D.barrier()
 

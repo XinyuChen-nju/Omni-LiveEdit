@@ -49,7 +49,7 @@ def get_source_refs(conditional_dict):
 
 
 def alloc_edit_caches(generator, batch_size, frame_seq, num_frames, ref_tokens,
-                      dtype, device):
+                      dtype, device, source_frames=None):
     """Allocate per-layer (condition, target) KV caches + cross-attn caches."""
     model = generator.model
     n_layers = len(model.blocks)
@@ -59,10 +59,13 @@ def alloc_edit_caches(generator, batch_size, frame_seq, num_frames, ref_tokens,
     sink_size = getattr(model, "sink_size", 0)
     rolling = local != -1
 
-    window = (local if local != -1 else num_frames) * frame_seq
-    cond_size = ref_tokens + window
+    target_window = (local if local != -1 else num_frames) * frame_seq
+    if source_frames is None:
+        source_frames = num_frames
+    source_window = (local if local != -1 else source_frames) * frame_seq
+    cond_size = ref_tokens + source_window
     tgt_sink = sink_size * frame_seq
-    tgt_size = window + tgt_sink
+    tgt_size = target_window + tgt_sink
 
     def mk(size, sink):
         return EditKVCache(batch_size, size, n_heads, head_dim,
@@ -75,7 +78,8 @@ def alloc_edit_caches(generator, batch_size, frame_seq, num_frames, ref_tokens,
     return cond_cache, tgt_cache, crossattn_cache
 
 
-def prefill_refs(generator, conditional_dict, refs, cond_cache, crossattn_cache):
+def prefill_refs(generator, conditional_dict, refs, cond_cache, crossattn_cache,
+                 ref_timestep=0):
     """Prefill the reference images as the never-evicted condition prefix.
 
     Returns the number of reference tokens written (== the cond-cache sink size)."""
@@ -87,7 +91,7 @@ def prefill_refs(generator, conditional_dict, refs, cond_cache, crossattn_cache)
             cond_latent=r, source_id=sid, rope_start_frame=0,
             cond_kv_cache=cond_cache, crossattn_cache=crossattn_cache,
             current_cond_start=cursor, conditional_dict=conditional_dict,
-            cond_timestep=0.0)
+            cond_timestep=float(ref_timestep))
         cursor += int(r.shape[1]) * edit_frame_seq(
             generator, int(r.shape[-2]), int(r.shape[-1])
         )

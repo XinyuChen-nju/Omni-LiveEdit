@@ -20,6 +20,12 @@ timestep_shift: 5.0               # flow-matching 时间步偏移
 cache_text_embeds: true           # 用预编码 prompt embeds + 缓存的负向 embed，训练时不加载 umT5-xxl（省 ~11GB/卡）
 teacher_forcing: true             # teacher forcing：用 GT 上下文喂入，稳定训练
 source_timestep_mode: target
+ref_timestep: 0                     # causal student ref time embedding; 0 = clean
+guidance_mode_by_task_type:
+  t2v: t2v
+  v2v: v2v_apg
+  tv2v: v2v_apg
+  rv2v: rv2v_apg
 discrete_cd_N: 48                 # 一致性蒸馏的离散时间步数 N（teacher 轨迹的细分粒度）
 guidance_scale: 3.0               # teacher 评分时的 CFG 引导强度
 num_train_timestep: 1000          # 扩散总时间步数

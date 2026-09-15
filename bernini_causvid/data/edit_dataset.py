@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import hashlib
 import random
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -40,6 +41,7 @@ TASK_TYPE_ALIASES = {
     "text2video": "t2v",
     "text_to_video": "t2v",
     "text-to-video": "t2v",
+    # S2V reserved: aliases accepted for parsing, then rejected as unimplemented.
     "s2v": "s2v",
     "i2v": "s2v",
     "image_to_video": "s2v",
@@ -47,17 +49,40 @@ TASK_TYPE_ALIASES = {
     "subject_to_video": "s2v",
     "subject-to-video": "s2v",
     "v2v": "v2v",
+    "tv2v": "v2v",
+    "t_v2v": "v2v",
+    "text_video_to_video": "v2v",
     "video_to_video": "v2v",
     "video-to-video": "v2v",
     "video_edit": "v2v",
-    "local_change": "v2v",
-    "global_style": "v2v",
-    "background_change": "v2v",
     "rv2v": "rv2v",
     "reference_video_to_video": "rv2v",
     "reference-video-to-video": "rv2v",
     "virtual_try_on": "rv2v",
     "motion_pair": "rv2v",
+}
+
+CANONICAL_EDIT_TYPES = {
+    "add", "remove", "replace", "style", "tryon",
+    "generate", "animate", "motion_transfer", "convert", "unknown",
+}
+
+EDIT_TYPE_ALIASES = {
+    "add": "add",
+    "remove": "remove",
+    "delete": "remove",
+    "replace": "replace",
+    "sub": "replace",
+    "style": "style",
+    "convert": "convert",
+    "tryon": "tryon",
+    "try_on": "tryon",
+    "virtual_try_on": "tryon",
+    "generate": "generate",
+    "animate": "animate",
+    "motion_transfer": "motion_transfer",
+    "unknown": "unknown",
+    "": "unknown",
 }
 
 _PATH_FIELDS = ("source", "target", "text_embed", "ode")
@@ -99,18 +124,34 @@ def _normalise_refs(value: Any) -> list:
 
 
 def _normalise_task_type(raw: Any, *, has_source: bool, has_refs: bool) -> str:
-    key = str(raw or "").strip().lower().replace(" ", "_")
+    key = str(raw or "").strip().lower().replace(" ", "_").replace("-", "_")
     if not key:
+        if has_source and has_refs:
+            return "rv2v"
         if has_source:
             return "v2v"
         if has_refs:
             return "s2v"
         return "t2v"
+    if key in ("i2i", "image_to_image"):
+        raise ValueError(
+            "task_type i2i is not supported in current training scope; "
+            "use t2v/v2v/rv2v (rv2v requires one garment ref)"
+        )
     try:
         return TASK_TYPE_ALIASES[key]
     except KeyError as exc:
-        allowed = ", ".join(("t2v", "s2v", "v2v", "rv2v"))
+        allowed = ", ".join(("t2v", "v2v", "rv2v"))
         raise ValueError(f"unsupported task_type {raw!r}; use one of {allowed}") from exc
+
+
+def _normalise_edit_type(raw: Any) -> tuple[str, str]:
+    raw_s = "" if raw is None else str(raw).strip()
+    key = raw_s.lower().replace(" ", "_").replace("-", "_")
+    canonical = EDIT_TYPE_ALIASES.get(key)
+    if canonical is None:
+        canonical = "unknown"
+    return canonical, raw_s
 
 
 def _normalise_item(
@@ -140,19 +181,39 @@ def _normalise_item(
         item.get("sample_id") or f"{dataset or 'sample'}_{ordinal:08d}"
     )
 
-    # Every dataset owns this annotation. Empty means not annotated yet; once a
-    # dataset adds it, the value is preserved without dataset-specific filtering.
-    item["edit_type"] = str(item.get("edit_type") or "").strip().lower()
+    edit_type, raw_edit_type = _normalise_edit_type(item.get("edit_type"))
+    item["edit_type"] = edit_type
+    item["raw_edit_type"] = raw_edit_type
 
-    if task == "s2v" and not refs:
-        raise ValueError(f"{item['sample_id']}: s2v requires at least one `refs` latent")
-    if task == "v2v" and not item.get("source"):
-        raise ValueError(f"{item['sample_id']}: v2v requires a `source` latent")
-    if task == "rv2v":
+    # Training scope: t2v / v2v / rv2v only; single-ref for rv2v.
+    if task == "s2v":
+        raise ValueError(
+            f"{item['sample_id']}: s2v is reserved but not implemented in current "
+            "training scope; use t2v/v2v/rv2v"
+        )
+    if task == "t2v":
+        if item.get("source"):
+            raise ValueError(f"{item['sample_id']}: t2v must not include `source`")
+        if refs:
+            raise ValueError(f"{item['sample_id']}: t2v must not include `refs`")
+    elif task == "v2v":
+        if not item.get("source"):
+            raise ValueError(f"{item['sample_id']}: v2v requires a `source` latent")
+        if refs:
+            raise ValueError(
+                f"{item['sample_id']}: v2v/tv2v must not include `refs` (got {len(refs)}); "
+                "use rv2v for source+ref editing"
+            )
+    elif task == "rv2v":
         if not item.get("source"):
             raise ValueError(f"{item['sample_id']}: rv2v requires a `source` latent")
-        if not refs:
-            raise ValueError(f"{item['sample_id']}: rv2v requires at least one `refs` latent")
+        if len(refs) != 1:
+            raise ValueError(
+                f"{item['sample_id']}: rv2v requires exactly one garment `refs` latent, "
+                f"got {len(refs)}"
+            )
+    else:
+        raise ValueError(f"{item['sample_id']}: unsupported task_type {task!r}")
     return item
 
 
@@ -604,9 +665,6 @@ class HomogeneousDistributedBatchSampler(Sampler[list[int]]):
             counts[name] += 1
         return counts
 
-    def __len__(self):
-        return self.num_batches
-
     def _edit_type_of_global_batch(self, global_batch: list[int]) -> str:
         return str(self.dataset.items[global_batch[0]]["edit_type"])
 
@@ -653,9 +711,12 @@ class HomogeneousDistributedBatchSampler(Sampler[list[int]]):
                 )
         return dict(result)
 
-    def __iter__(self):
-        epoch = self.epoch
-        self.epoch += 1
+    def _epoch_schedule(self, epoch: int) -> list[list[int]]:
+        """Deterministic packed global-batch schedule for one epoch.
+
+        Includes grad-accum padding so ``len(schedule)`` equals the number of
+        batches actually yielded by ``__iter__``.
+        """
         rng = random.Random(self.seed + epoch)
         batches_by_dataset = self._global_batches_by_dataset(rng)
         global_batches = []
@@ -671,7 +732,61 @@ class HomogeneousDistributedBatchSampler(Sampler[list[int]]):
             global_batches.extend(selected)
         if self.shuffle:
             rng.shuffle(global_batches)
-        global_batches = self._pack_global_batches_for_accum(global_batches, rng)
+        return self._pack_global_batches_for_accum(global_batches, rng)
+
+    def __len__(self):
+        # Upcoming epoch length, including accum padding.
+        return len(self._epoch_schedule(self.epoch))
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def _schedule_hash(self, schedule) -> str:
+        payload = repr([[int(i) for i in batch] for batch in schedule]).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()[:16]
+
+    def state_dict(self):
+        upcoming = self._epoch_schedule(int(self.epoch))
+        return {
+            "epoch": int(self.epoch),
+            "seed": int(self.seed),
+            "schedule_hash": self._schedule_hash(upcoming),
+            "cursor": int(getattr(self, "cursor", 0)),
+            "active_epoch": getattr(self, "_active_epoch", None),
+            "active_schedule_hash": getattr(self, "_active_schedule_hash", None),
+        }
+
+    def load_state_dict(self, state):
+        self.epoch = int(state.get("epoch", 0))
+        if "seed" in state:
+            self.seed = int(state["seed"])
+        self.cursor = int(state.get("cursor", 0))
+        self._active_epoch = state.get("active_epoch")
+        self._active_schedule_hash = state.get("active_schedule_hash")
+        expected = state.get("schedule_hash")
+        if expected is not None:
+            got = self._schedule_hash(self._epoch_schedule(self.epoch))
+            if got != expected and self.cursor == 0 and self._active_epoch is None:
+                raise RuntimeError(
+                    f"sampler schedule_hash mismatch at epoch={self.epoch}: "
+                    f"ckpt={expected} now={got}"
+                )
+
+    def __iter__(self):
+        # Mid-epoch resume: continue the previously active epoch from cursor.
+        if getattr(self, "_active_epoch", None) is not None and int(getattr(self, "cursor", 0)) > 0:
+            epoch = int(self._active_epoch)
+        else:
+            epoch = self.epoch
+        global_batches = self._epoch_schedule(epoch)
+        self._active_epoch = epoch
+        self._active_schedule_hash = self._schedule_hash(global_batches)
         rank_start = self.rank * self.batch_size
-        for global_batch in global_batches:
-            yield global_batch[rank_start : rank_start + self.batch_size]
+        start = int(getattr(self, "cursor", 0))
+        for i in range(start, len(global_batches)):
+            self.cursor = i + 1
+            yield global_batches[i][rank_start : rank_start + self.batch_size]
+        self.epoch = epoch + 1
+        self.cursor = 0
+        self._active_epoch = None
+        self._active_schedule_hash = None

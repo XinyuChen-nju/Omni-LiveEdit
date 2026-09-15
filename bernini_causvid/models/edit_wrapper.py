@@ -84,6 +84,8 @@ class EditDiffusionWrapper(nn.Module):
         source_timesteps = self._cond_list(
             conditional_dict, "source_timesteps")
         ref_latents = self._cond_list(conditional_dict, "ref_latents")
+        ref_timesteps = self._cond_list(
+            conditional_dict, "ref_timesteps")
 
         cond_latents = []
         sid = 1
@@ -95,26 +97,38 @@ class EditDiffusionWrapper(nn.Module):
                 (v.permute(0, 2, 1, 3, 4), sid, True, src_t)
             )
             sid += 1
-        for r in ref_latents:
+        for i, r in enumerate(ref_latents):
+            # Ref regions use their own fixed timestep when supplied by a causal
+            # student stage. Bidirectional score/teacher calls omit this key and
+            # retain the original target-timestep behaviour.
+            ref_t = ref_timesteps[i] if i < len(ref_timesteps) else None
             cond_latents.append(
-                (r.permute(0, 2, 1, 3, 4), sid, False, None)
+                (r.permute(0, 2, 1, 3, 4), sid, False, ref_t)
             )
             sid += 1
 
-        flow_pred = self.model.forward_edit(
+        model_out = self.model.forward_edit(
             x=noisy_image_or_video.permute(0, 2, 1, 3, 4),
             t=timestep if not self.uniform_timestep else timestep[:, 0],
             context=prompt_embeds,
             cond_latents=cond_latents,
             clean_target=clean_x.permute(0, 2, 1, 3, 4) if clean_x is not None else None,
             aug_t=aug_t,
-        ).permute(0, 2, 1, 3, 4)
+            ref_attn_mask=conditional_dict.get("ref_attn_mask"),
+            ref_attn_config=conditional_dict.get("ref_attn_config"),
+        )
+        attn_aux = None
+        if isinstance(model_out, tuple):
+            model_out, attn_aux = model_out
+        flow_pred = model_out.permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(
             flow_pred=flow_pred.flatten(0, 1),
             xt=noisy_image_or_video.flatten(0, 1),
             timestep=timestep.flatten(0, 1),
         ).unflatten(0, flow_pred.shape[:2])
+        if attn_aux is not None:
+            return flow_pred, pred_x0, attn_aux
         return flow_pred, pred_x0
 
     # ------------------------------------------------------------------

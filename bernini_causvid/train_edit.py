@@ -44,6 +44,13 @@ from bernini_causvid.models.edit_dmd import EditDMD
 from bernini_causvid.pipeline.edit_causal_inference import EditCausalInferencePipeline
 from bernini_causvid.data.edit_dataset import EditLatentDataset, edit_collate
 from bernini_causvid.train_common import Logger, append_jsonl, find_latest
+from bernini_causvid.train_state import (
+    RESUME_CONTRACT,
+    atomic_torch_save,
+    capture_rng_state,
+    restore_rng_state,
+    stable_sample_seed,
+)
 from bernini_causvid import dist_common as D
 from utils.dataset import cycle
 
@@ -344,9 +351,20 @@ def main():
     # ---- data ------------------------------------------------------------
     # load_target=True 仅用于进度采样的 source/target 参考视频和 latent MSE；
     # DMD 训练损失本身不会读取 target_latent。
-    dataset = EditLatentDataset(cfg.data_path, load_target=True)
-    loader = D.make_loader(dataset, cfg.batch_size, edit_collate, distributed, gradient_accumulation_steps=grad_accum)
+    dataset = EditLatentDataset(
+        cfg.data_path,
+        load_target=True,
+        dataset_max_lat_frames=getattr(cfg, "dataset_max_lat_frames", None),
+    )
+    loader = D.make_loader(
+        dataset, cfg.batch_size, edit_collate, distributed,
+        dataset_sampling_weights=getattr(cfg, "dataset_sampling_weights", None),
+        gradient_accumulation_steps=grad_accum,
+    )
     data = cycle(loader)
+    if hasattr(loader, "batch_sampler") and hasattr(loader.batch_sampler, "dataset_batch_counts"):
+        log("[train] dataset batches per epoch "
+            + str(dict(sorted(loader.batch_sampler.dataset_batch_counts.items()))))
     log(f"[train] dataset size {len(dataset)} | grad_accum {grad_accum} | global batch "
         f"{cfg.batch_size * dist_info['world_size'] * grad_accum} "
         f"(per-gpu micro-batch {cfg.batch_size} x world {dist_info['world_size']} x accum {grad_accum})")
@@ -403,8 +421,10 @@ def main():
             cond["ref_latents"] = [
                 ref.to(device, dtype) for ref in batch["ref_latents"]
             ]
-        if "task_types" in batch:
-            cond["task_types"] = list(batch["task_types"])
+        task_types = batch.get("task_types")
+        if task_types is None:
+            raise ValueError("DMD batches must provide task_types for guidance routing")
+        cond["task_types"] = list(task_types)
         uncond = {
             "prompt_embeds": uncond_cache["prompt_embeds"].expand(
                 b, -1, -1
@@ -637,12 +657,12 @@ def main():
             if is_main:
                 d = os.path.join(ckpt_dir, f"checkpoint_model_{step:06d}")
                 os.makedirs(d, exist_ok=True)
-                save_dict = {"generator": gen_sd, "critic": crit_sd,
+                save_dict = {"resume_contract": RESUME_CONTRACT, "rng_state": capture_rng_state(device), "generator": gen_sd, "critic": crit_sd,
                              "gen_optimizer": gen_optim_sd,
                              "crit_optimizer": crit_optim_sd, "step": step}
                 if ema_sd is not None:
                     save_dict["generator_ema"] = ema_sd
-                torch.save(save_dict, os.path.join(d, "model.pt"))
+                atomic_torch_save(save_dict, os.path.join(d, "model.pt"), extra_meta={"step": int(step)})
                 log(f"[train] saved {d}/model.pt (+optim"
                     + ("+ema)" if ema_sd is not None else ")"))
             D.barrier()

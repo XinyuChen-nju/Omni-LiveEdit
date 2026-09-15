@@ -9,6 +9,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from bernini_causvid.models.edit_dmd import EditDMD
 from bernini_causvid.models.bernini_teacher import BerniniEditTeacher
 from bernini_causvid.models.causal_edit_model import CausalEditWanModel
+from bernini_causvid.pipeline.edit_self_forcing_training import (
+    EditSelfForcingTrainingPipeline,
+)
 
 
 def _bare_dmd(mode):
@@ -123,17 +126,38 @@ def test_dual_teacher_uses_one_timestep_per_batch():
 
 
 
+
 def test_resolve_guidance_modes_by_task_type():
     model = EditDMD.__new__(EditDMD)
     torch.nn.Module.__init__(model)
     model.default_guidance_mode = "v2v_apg"
     model.guidance_mode_by_task_type = {
         "t2v": "t2v",
-        "rv2v": "rv2v",
+        "v2v": "v2v_apg",
+        "rv2v": "rv2v_apg",
     }
-    modes = model._resolve_guidance_modes(["t2v", "rv2v", "v2v", ""])
-    assert modes == ["t2v", "rv2v", "v2v_apg", "v2v_apg"]
-    print("[ok] guidance modes resolve from task_type map")
+    modes = model._resolve_guidance_modes(["t2v", "rv2v", "v2v"])
+    assert modes == ["t2v", "rv2v_apg", "v2v_apg"]
+    try:
+        model._resolve_guidance_modes(["t2v", ""])
+        raise AssertionError("empty task_type should fail-fast")
+    except ValueError:
+        pass
+    try:
+        model._resolve_guidance_modes(["unknown"])
+        raise AssertionError("unknown task_type should fail-fast")
+    except ValueError:
+        pass
+    print("[ok] guidance modes resolve from task_type map (strict)")
+
+
+def test_single_frame_rollout_uses_partial_video_block():
+    ranges = EditSelfForcingTrainingPipeline._block_ranges(1, 3)
+    assert ranges == [(0, 1)]
+    assert EditSelfForcingTrainingPipeline._block_ranges(7, 3) == [
+        (0, 3), (3, 6), (6, 7),
+    ]
+    print("[ok] DMD rollout preserves single-frame image batches")
 
 
 def test_teacher_mixed_guidance_mode_groups_batch():
@@ -178,5 +202,6 @@ if __name__ == "__main__":
     test_dual_teacher_rejects_mixed_expert_batch()
     test_dual_teacher_uses_one_timestep_per_batch()
     test_resolve_guidance_modes_by_task_type()
+    test_single_frame_rollout_uses_partial_video_block()
     test_teacher_mixed_guidance_mode_groups_batch()
     print("ALL PASS")

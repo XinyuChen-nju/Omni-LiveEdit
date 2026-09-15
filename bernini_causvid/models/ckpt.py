@@ -10,7 +10,8 @@ import torch
 
 def load_edit_generator_state(path: str) -> dict:
     """Return an `EditDiffusionWrapper.state_dict()`-compatible state from a ckpt."""
-    sd = torch.load(path, map_location="cpu")
+    # Stage checkpoints are trusted local artifacts and include optimizer/RNG objects.
+    sd = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(sd, dict) and "generator_ema" in sd:
         return sd["generator_ema"]
     if isinstance(sd, dict) and "generator" in sd:

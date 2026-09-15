@@ -9,6 +9,12 @@ timestep_shift: 5.0
 cache_text_embeds: true
 teacher_forcing: true
 source_timestep_mode: source
+ref_timestep: 0                     # causal student ref time embedding; 0 = clean
+guidance_mode_by_task_type:
+  t2v: t2v
+  v2v: v2v_apg
+  tv2v: v2v_apg
+  rv2v: rv2v_apg
 discrete_cd_N: 48
 guidance_scale: 3.0
 num_train_timestep: 1000

@@ -124,7 +124,7 @@ class BerniniEditTeacher(nn.Module):
             cond_latents=cond_latents, edit_mode=True)
 
 
-    VALID_GUIDANCE_MODES = ("t2v", "v2v", "v2v_apg", "rv2v", "i2i")
+    VALID_GUIDANCE_MODES = ("t2v", "v2v", "v2v_apg", "rv2v", "rv2v_apg", "i2i", "s2v_apg")
 
     @staticmethod
     def _to_bcfhw(lat: torch.Tensor) -> torch.Tensor:
@@ -189,6 +189,24 @@ class BerniniEditTeacher(nn.Module):
                 v_cond_flow.flatten(0, 1), noisy_image_or_video.flatten(0, 1),
                 timestep.flatten(0, 1)).unflatten(0, (b, f))
             return self._apg(x0_cond, x0_uncond, omega_ti)
+        if mode == "rv2v_apg":
+            # Progressive APG chain in x0 space:
+            # uncond -> source -> source+ref -> source+ref+text.
+            def _x0(flow_bcfhw):
+                return self._convert_flow_pred_to_x0(
+                    flow_bcfhw.flatten(0, 1), noisy_image_or_video.flatten(0, 1),
+                    timestep.flatten(0, 1)).unflatten(0, (b, f))
+            x0_0 = _x0(self._flow(x, timestep, text_uncond, [], use_low).permute(0, 2, 1, 3, 4))
+            x0_v = _x0(self._flow(x, timestep, text_uncond, v_cond, use_low).permute(0, 2, 1, 3, 4))
+            x0_vi = _x0(self._flow(x, timestep, text_uncond, vi_cond, use_low).permute(0, 2, 1, 3, 4))
+            x0_vti = _x0(self._flow(x, timestep, text_cond, vi_cond, use_low).permute(0, 2, 1, 3, 4))
+            guided = self._apg(x0_v, x0_0, omega_v)
+            guided = self._apg(x0_vi, guided, omega_i)
+            guided = self._apg(x0_vti, guided, omega_ti)
+            return guided
+        if mode == "s2v_apg":
+            raise NotImplementedError(
+                "s2v_apg is reserved but not implemented in current training scope")
         if mode in ("v2v", "i2i"):
             eps_vi = self._flow(x, timestep, text_uncond, vi_cond, use_low)
             eps_vti = self._flow(x, timestep, text_cond, vi_cond, use_low)

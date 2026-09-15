@@ -30,6 +30,7 @@ allow_raw_bernini_init: false
 
 # ---- source 条件语义 -------------------------------------------------------
 source_timestep_mode: source
+ref_timestep: 0                     # causal student ref time embedding; 0 = clean
 source_noise: 0
 context_noise: 0
 score_source_timestep_mode: target
@@ -39,10 +40,9 @@ score_causal_source: false
 guidance_mode: v2v_apg
 guidance_mode_by_task_type:
   t2v: t2v
-  s2v: v2v_apg
   v2v: v2v_apg
-  i2i: v2v_apg
-  rv2v: rv2v
+  tv2v: v2v_apg
+  rv2v: rv2v_apg
 guidance_scale: 3.0
 omega_v: 1.25
 omega_i: 4.5

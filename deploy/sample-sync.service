@@ -1,0 +1,24 @@
+[Unit]
+Description=Mirror training samples to xrtm dataset storage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/dlami/nvme/chenxinyu/project/Universal-Edit-Forcing
+ExecStart=/usr/bin/python3 tools/sample_sync.py --config configs/sample_sync.yaml
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+StateDirectory=xrtm-sample-sync
+RuntimeDirectory=xrtm-sample-sync
+Environment=PYTHONUNBUFFERED=1
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,87 @@
+# Stage 2 CD: same mix as AR t2v/tv2v 40:60, init from AR step 10000.
+model_name: Bernini-R-1.3B
+model_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Bernini-R-1.3B-Wan
+text_encoder_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+vae_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+causal: true
+num_frame_per_block: 3
+timestep_shift: 5.0
+cache_text_embeds: true
+teacher_forcing: true
+source_timestep_mode: source
+ref_timestep: 0                     # causal student ref time embedding; 0 = clean
+noise_augmentation_max_timestep: 100
+source_noise_max_timestep: 100
+num_train_timestep: 1000
+discrete_cd_N: 48
+guidance_scale: 3.0
+guidance_mode_by_task_type:
+  t2v: t2v
+  s2v: v2v_apg
+  v2v: v2v_apg
+  i2i: v2v_apg
+  rv2v: rv2v_apg
+apg_eta: 0.5
+apg_norm_thresholds: [50.0, 50.0, 50.0]
+omega_v: 1.25
+omega_i: 4.5
+omega_ti: 4.0
+generator_ckpt: /opt/dlami/nvme/chenxinyu/project/Universal-Edit-Forcing/runs/ar_t2v_tv2v_40_60/20260824_135219/checkpoints/checkpoint_model_010000/model.pt
+dataset_max_lat_frames:
+  openvid_t2v: 21
+  reco: 21
+  openve_3m_60k: 21
+  add_delete_sub_good_only: 21
+region_loss: false
+region_edit_weight: 2.0
+region_mask_threshold: 0.10
+region_mask_soft: false
+region_weight_normalize: true
+region_loss_by_type:
+  add: true
+  remove: true
+  replace: true
+  convert: false
+  style: false
+  generate: false
+  animate: false
+  motion_transfer: false
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+mixed_precision: true
+gradient_checkpointing: true
+batch_size: 2
+gradient_accumulation_steps: 1
+lr: 5.0e-7
+beta1: 0.0
+beta2: 0.999
+weight_decay: 0.0
+ema_weight: 0.99
+ema_start_step: 0
+seed: 0
+sharding_strategy: grad_op
+data_path: /opt/dlami/nvme/chenxinyu/data/Universal-Edit-Metadata/mixed_train/index_t2v_tv2v_no_tripvvt.json
+dataset_sampling_weights:
+  openvid_t2v: 0.40
+  reco: 0.20
+  openve_3m_60k: 0.20
+  add_delete_sub_good_only: 0.20
+eval_samples:
+- name: t2v_openvid
+  dataset: openvid_t2v
+  task_type: t2v
+- name: v2v_reco
+  dataset: reco
+  task_type: v2v
+- name: v2v_openve
+  dataset: openve_3m_60k
+  task_type: v2v
+- name: v2v_add_delete_sub
+  dataset: add_delete_sub_good_only
+  task_type: v2v
+negative_prompt: 鑹茶皟鑹充附锛岃繃鏇濓紝闈欐€侊紝缁嗚妭妯＄硦涓嶆竻锛屽瓧骞曪紝椋庢牸锛屼綔鍝侊紝鐢讳綔锛岀敾闈紝闈欐锛屾暣浣撳彂鐏帮紝鏈€宸川閲忥紝浣庤川閲忥紝JPEG鍘嬬缉娈嬬暀锛屼笐闄嬬殑锛屾畫缂虹殑锛屽浣欑殑鎵嬫寚锛岀敾寰椾笉濂界殑鎵嬮儴锛岀敾寰椾笉濂界殑鑴搁儴锛岀暩褰㈢殑锛屾瘉瀹圭殑锛屽舰鎬佺暩褰㈢殑鑲綋锛屾墜鎸囪瀺鍚堬紝闈欐涓嶅姩鐨勭敾闈紝鏉備贡鐨勮儗鏅紝涓夋潯鑵匡紝鑳屾櫙浜哄緢澶氾紝鍊掔潃璧?

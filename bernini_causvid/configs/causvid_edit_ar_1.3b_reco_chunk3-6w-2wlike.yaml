@@ -30,6 +30,7 @@ noise_augmentation_max_timestep: 100
 # 由于 timesteps≈sigma*1000，此值≈最大噪声占比×1000：100 ≈ 最多 ~10% 噪声（均值 ~5%）。
 # 推理端 EditCausalInferencePipeline.source_noise 同义，建议推理设 0（干净源）。
 source_noise_max_timestep: 100
+ref_timestep: 0  # AR policy: clean Ref, no auxiliary attention/region losses
 num_train_timestep: 1000          # 扩散总时间步数
 denoising_loss_type: flow         # 去噪回归损失：flow（flow-matching）
 
@@ -37,7 +38,8 @@ denoising_loss_type: flow         # 去噪回归损失：flow（flow-matching）
 # 编辑区（GT 目标与源在 latent 上差异大的区域）在 flow loss 里加权，避免小编辑被
 # 大面积易复制背景淹没、梯度被稀释（导致后续帧编辑塌回源）。mask 逐帧由
 # |target-source| 现算。region_loss=false 时与原损失完全一致。
-region_loss: true                 # 总开关
+region_loss: false  # 总开关
+ref_attn_loss: false  # AR policy: clean Ref, no auxiliary attention/region losses
 region_edit_weight: 2.0           # 编辑区额外权重：该区 loss 乘 (1+该值)
 region_mask_threshold: 0.10       # 归一化 src↔tgt 差异 > 该阈值判为编辑区（硬 mask）
 region_mask_soft: false           # false=硬 mask(0/1)；true=连续软权重(0~1)

@@ -255,6 +255,12 @@ class TextImagePairDataset(Dataset):
 
 
 def cycle(dl):
+    """Yield batches forever, advancing epoch-aware samplers each pass."""
+    sampler = getattr(dl, "sampler", None)
+    epoch = 0
     while True:
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
         for data in dl:
             yield data
+        epoch += 1

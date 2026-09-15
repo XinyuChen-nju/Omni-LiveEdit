@@ -117,28 +117,16 @@ def test_rope_matches_framework():
 def test_independent_reference_grids_use_actual_token_counts():
     class Model:
         patch_size = (1, 2, 2)
-
     class RecordingGenerator:
         def __init__(self):
             self.model = Model()
             self.calls = []
-
         def __call__(self, **kwargs):
             self.calls.append(kwargs)
-
     generator = RecordingGenerator()
-    refs = [
-        torch.randn(1, 1, 16, 8, 6),   # 1 * 4 * 3 = 12 tokens
-        torch.randn(1, 2, 16, 10, 4),  # 2 * 5 * 2 = 20 tokens
-    ]
+    refs = [torch.randn(1, 1, 16, 8, 6), torch.randn(1, 2, 16, 10, 4)]
     assert ref_token_count(generator, refs) == 32
-    written = prefill_refs(
-        generator=generator,
-        conditional_dict={"prompt_embeds": ["unused"]},
-        refs=refs,
-        cond_cache=["cond"],
-        crossattn_cache=["cross"],
-    )
+    written = prefill_refs(generator, {"prompt_embeds": ["unused"]}, refs, ["cond"], ["cross"])
     assert written == 32
     assert [c["current_cond_start"] for c in generator.calls] == [0, 12]
     assert [c["source_id"] for c in generator.calls] == [2, 3]

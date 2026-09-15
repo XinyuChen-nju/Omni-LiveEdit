@@ -14,9 +14,12 @@ timestep_shift: 5.0               # flow-matching 时间步偏移
 
 # ---- teacher forcing -------------------------------------------------------
 teacher_forcing: true             # teacher forcing：用 GT 上下文喂入，稳定训练
+ref_timestep: 0  # AR policy: clean Ref, no auxiliary attention/region losses
 noise_augmentation_max_timestep: 0   # 给干净上下文加噪的最大步数（>0 时启用上下文噪声增强）
 num_train_timestep: 1000          # 扩散总时间步数
 denoising_loss_type: flow         # 去噪回归损失：flow（flow-matching）
+region_loss: false  # AR policy: clean Ref, no auxiliary attention/region losses
+ref_attn_loss: false  # AR policy: clean Ref, no auxiliary attention/region losses
 
 # latent 视频几何 [B, F, C, H, W]，对应 480x832、81 帧（与源对齐）。
 image_or_video_shape:

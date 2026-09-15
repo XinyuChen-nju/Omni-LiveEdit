@@ -1,0 +1,57 @@
+model_name: Bernini-R-1.3B
+model_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Bernini-R-1.3B-Wan
+text_encoder_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+vae_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+causal: true
+num_frame_per_block: 3
+timestep_shift: 5.0
+cache_text_embeds: true
+teacher_forcing: true
+noise_augmentation_max_timestep: 100
+source_noise_max_timestep: 100
+source_timestep_mode: source
+ref_timestep: 0  # causal student ref time embedding; 0 = clean
+num_train_timestep: 1000
+denoising_loss_type: flow
+region_loss: false
+region_edit_weight: 2.0
+region_mask_threshold: 0.1
+region_mask_soft: false
+region_weight_normalize: true
+region_loss_by_type:
+  tryon: false
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+mixed_precision: true
+gradient_checkpointing: true
+batch_size: 1
+gradient_accumulation_steps: 1
+lr: 2.0e-06
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.0
+ema_weight: 0.0
+ema_start_step: 0
+seed: 0
+sharding_strategy: grad_op
+data_path: /opt/dlami/nvme/chenxinyu/data/Universal-Edit-Metadata/mixed_train/index_tripvvt_bernini_ref6m_single_ref.json
+dataset_sampling_weights:
+  tripvvt_tv2v: 27828
+  ref6m_tryon: 50000
+eval_samples:
+- name: rv2v_tripvvt_bernini
+  dataset: tripvvt_tv2v
+  task_type: rv2v
+  edit_type: tryon
+- name: rv2v_ref6m
+  dataset: ref6m_tryon
+  task_type: rv2v
+  edit_type: tryon
+negative_prompt: 色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走
+ref_attn_loss: false
+ref_attn_loss_weight: 0.0

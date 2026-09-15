@@ -33,6 +33,13 @@ from bernini_causvid.models.edit_diffusion import EditDiffusion
 from bernini_causvid.pipeline.edit_causal_inference import EditCausalInferencePipeline
 from bernini_causvid.data.edit_dataset import EditLatentDataset, edit_collate
 from bernini_causvid.train_common import Logger, append_jsonl, find_latest
+from bernini_causvid.train_state import (
+    RESUME_CONTRACT,
+    atomic_torch_save,
+    capture_rng_state,
+    restore_rng_state,
+    stable_sample_seed,
+)
 from bernini_causvid import dist_common as D
 from utils.dataset import cycle
 from utils.scheduler import FlowMatchScheduler
@@ -41,6 +48,19 @@ from utils.scheduler import FlowMatchScheduler
 # 编辑类型直接来自 index.json 的 edit_type 字段。
 # add/remove/replace 用区域 mask；style/convert 按 config.region_loss_by_type 关闭区域 mask。
 EDIT_KINDS = [("add", "增"), ("remove", "删"), ("replace", "改"), ("style", "风格化")]
+
+
+def validate_ar_training_policy(config) -> None:
+    """Reject Stage-1 AR configs that violate the clean-Ref/no-aux-loss policy."""
+    ref_timestep = float(getattr(config, "ref_timestep", 0) or 0)
+    if abs(ref_timestep) > 1e-8:
+        raise ValueError(
+            f"Stage-1 AR requires ref_timestep=0, got {ref_timestep}"
+        )
+    if bool(getattr(config, "ref_attn_loss", False)):
+        raise ValueError("Stage-1 AR requires ref_attn_loss=false")
+    if bool(getattr(config, "region_loss", False)):
+        raise ValueError("Stage-1 AR requires region_loss=false")
 
 
 def select_eval_items(items, kinds):
@@ -168,6 +188,7 @@ def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_sche
         noise=noise,
         conditional_dict=cond,
         return_latents=True,
+        rng=noise_generator
     )
     if not is_main:
         return None
@@ -224,6 +245,7 @@ def main():
         OmegaConf.load("configs/default_config.yaml"),
         OmegaConf.load(args.config),
     )
+    validate_ar_training_policy(cfg)
     # CLI/env overrides from the launch script should be reflected in the saved
     # run config, so the run directory is enough to reproduce the actual run.
     grad_accum = args.grad_accum if args.grad_accum and args.grad_accum > 0 \
@@ -280,6 +302,7 @@ def main():
     # ---- resume: load weights into the RAW module BEFORE FSDP shards it -----
     # (optimizer state is restored AFTER the optimizer is built, see below)
     step, resume_ema_sd, resume_optim_sd = 0, None, None
+    pending_sampler_state = None
     if args.resume:
         path = find_latest(ckpt_dir)[0] if args.resume == "auto" else args.resume
         if path and os.path.exists(path):
@@ -291,6 +314,13 @@ def main():
             resume_ema_sd = sd.get("generator_ema")
             resume_optim_sd = sd.get("optimizer")
             log(f"[train] resumed from {path} at step {step}")
+            if sd.get("resume_contract") == RESUME_CONTRACT:
+                if "rng_state" in sd:
+                    restore_rng_state(sd["rng_state"])
+                pending_sampler_state = sd.get("sampler_state")
+            else:
+                log("[train] legacy checkpoint: approximate resume (missing rng/sampler contract)")
+                pending_sampler_state = None
 
     if distributed:
         # trainable generator: fp32 master weights, FSDP MixedPrecision -> bf16 compute
@@ -328,6 +358,9 @@ def main():
         gradient_accumulation_steps=grad_accum,
     )
     data = cycle(loader)
+    if pending_sampler_state is not None and hasattr(loader, "batch_sampler") and hasattr(loader.batch_sampler, "load_state_dict"):
+        loader.batch_sampler.load_state_dict(pending_sampler_state)
+        log("[train] restored sampler_state from checkpoint")
     if hasattr(loader.batch_sampler, "dataset_batch_counts"):
         log(
             "[train] dataset batches per epoch "
@@ -438,6 +471,8 @@ def main():
         accum_edit = 0.0        # ReCo edit-region-only flow MSE (diagnostic)
         accum_edit_frac = 0.0   # editing-region fraction of the frame (diagnostic)
         edit_micro = 0          # micro-batches that reported the edit diagnostics
+        accum_ref_attn = accum_ref_score = accum_src_score = accum_attn_delta = 0.0
+        ref_attn_micro = 0
         for _ in range(grad_accum):
             batch = next(data)
             if "target_latent" not in batch:
@@ -456,6 +491,12 @@ def main():
                 accum_edit += float(ld["edit_region_loss"])
                 accum_edit_frac += float(ld["edit_frac"])
                 edit_micro += 1
+            if "ref_attn_loss" in ld:
+                accum_ref_attn += float(ld["ref_attn_loss"])
+                accum_ref_score += float(ld["ref_attn_ref_score"])
+                accum_src_score += float(ld["ref_attn_src_score"])
+                accum_attn_delta += float(ld["ref_attn_delta"])
+                ref_attn_micro += 1
         loss_micro = accum_loss / grad_accum  # 本 optimizer step 内 micro-batch 的平均损失
         edit_loss_micro = (accum_edit / edit_micro) if edit_micro else None
         edit_frac_micro = (accum_edit_frac / edit_micro) if edit_micro else None
@@ -480,6 +521,11 @@ def main():
             edit_sum_v = D.reduce_mean(float(accum_edit), distributed)
             edit_frac_sum_v = D.reduce_mean(float(accum_edit_frac), distributed)
             edit_count_v = D.reduce_mean(float(edit_micro), distributed)
+            ref_attn_sum_v = D.reduce_mean(float(accum_ref_attn), distributed)
+            ref_score_sum_v = D.reduce_mean(float(accum_ref_score), distributed)
+            src_score_sum_v = D.reduce_mean(float(accum_src_score), distributed)
+            attn_delta_sum_v = D.reduce_mean(float(accum_attn_delta), distributed)
+            ref_attn_count_v = D.reduce_mean(float(ref_attn_micro), distributed)
 
             msg = (f"[train] step {step}/{args.max_iters} | loss {loss_v:.4f} "
                    f"| grad_norm {float(gnorm):.3f} | {dt:.2f}s/{args.log_every}it")
@@ -492,6 +538,14 @@ def main():
                 frac_v = edit_frac_sum_v / edit_count_v
                 msg += f" | edit_loss {edit_v:.4f} | edit_frac {frac_v:.3f}"
                 extra = {"edit_region_loss": edit_v, "edit_frac": frac_v}
+            if ref_attn_count_v > 0.0:
+                attn_v = ref_attn_sum_v / ref_attn_count_v
+                ref_v = ref_score_sum_v / ref_attn_count_v
+                src_v = src_score_sum_v / ref_attn_count_v
+                delta_v = attn_delta_sum_v / ref_attn_count_v
+                msg += f" | ref_attn {attn_v:.4f} | ref-src {delta_v:.4f}"
+                extra.update({"ref_attn_loss": attn_v, "ref_attn_ref_score": ref_v,
+                              "ref_attn_src_score": src_v, "ref_attn_delta": delta_v})
             log(msg)
             if is_main:
                 append_jsonl(metrics_path, {"step": step, "loss": loss_v,
@@ -502,9 +556,12 @@ def main():
                 writer.add_scalar("train/grad_norm", float(gnorm), step)
                 writer.add_scalar("train/sec_per_window", dt, step)
                 writer.add_scalar("train/lr", cfg.lr, step)
-                if extra:
+                if "edit_region_loss" in extra:
                     writer.add_scalar("train/edit_region_loss", extra["edit_region_loss"], step)
                     writer.add_scalar("train/edit_frac", extra["edit_frac"], step)
+                if "ref_attn_loss" in extra:
+                    for key in ("ref_attn_loss", "ref_attn_ref_score", "ref_attn_src_score", "ref_attn_delta"):
+                        writer.add_scalar(f"train/{key}", extra[key], step)
 
         if step % args.save_every == 0:
             # full_state_dict / optim_full_state_dict are collectives:
@@ -515,10 +572,14 @@ def main():
             if is_main:
                 d = os.path.join(ckpt_dir, f"checkpoint_model_{step:06d}")
                 os.makedirs(d, exist_ok=True)
-                save_dict = {"generator": gen_sd, "optimizer": optim_sd, "step": step}
+                save_dict = {"generator": gen_sd, "optimizer": optim_sd, "step": step,
+                             "resume_contract": RESUME_CONTRACT,
+                             "rng_state": capture_rng_state(device)}
                 if ema_sd is not None:
                     save_dict["generator_ema"] = ema_sd
-                torch.save(save_dict, os.path.join(d, "model.pt"))
+                if hasattr(loader, "batch_sampler") and hasattr(loader.batch_sampler, "state_dict"):
+                    save_dict["sampler_state"] = loader.batch_sampler.state_dict()
+                atomic_torch_save(save_dict, os.path.join(d, "model.pt"), extra_meta={"step": int(step)})
                 log(f"[train] saved {d}/model.pt (+optim"
                     + ("+ema)" if ema_sd is not None else ")"))
             D.barrier()

@@ -1,0 +1,19 @@
+# Stable training cases -> overseas cos_srv -> domestic COS -> data_srv Dataset.
+runs_root: /opt/dlami/nvme/chenxinyu/project/Universal-Edit-Forcing/runs
+cos_base_url: http://open-api-oversea.xrtm-infra.com
+data_srv_url: http://140.207.124.187
+dataset_name: universal-edit-training-eval
+bucket_alias: buffer
+bucket_name: xrtm-buffer-1258344702
+cos_prefix: training-eval
+manifest_prefix: training-eval-manifests
+state_db: /var/lib/xrtm-sample-sync/data_srv_state.sqlite3
+writer_state_db: /var/lib/xrtm-sample-sync/writer_state.sqlite3
+scan_interval_seconds: 300
+stable_seconds: 60
+workers: 2
+request_timeout_seconds: 120
+retry_base_seconds: 30
+retry_max_seconds: 1800
+append_batch_size: 50
+flush_interval_seconds: 300

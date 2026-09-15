@@ -26,6 +26,7 @@ allow_raw_bernini_init: false      # 禁止错误地从 Bernini 原始权重直�
 # generator 的 clean source token 跟随当前 target timestep 调制；每个去噪步
 # 重写所有当前可见 source K/V，避免缓存混入上一 timestep。
 source_timestep_mode: target          # target | source
+ref_timestep: 0                     # causal student ref time embedding; 0 = clean
 source_noise: 0                       # source 模式下使用的固定 timestep
 context_noise: 0                      # target 历史写回 cache 的 timestep
 
@@ -37,10 +38,9 @@ score_causal_source: false             # 双向 score 可见完整 source
 guidance_mode: v2v_apg
 guidance_mode_by_task_type:
   t2v: t2v
-  s2v: v2v_apg
   v2v: v2v_apg
-  i2i: v2v_apg
-  rv2v: rv2v
+  tv2v: v2v_apg
+  rv2v: rv2v_apg
 guidance_scale: 3.0
 omega_v: 1.25                     # 视频条件分支引导权重
 omega_i: 4.5                      # 图像 / source 条件分支引导权重

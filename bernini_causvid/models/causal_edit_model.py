@@ -43,6 +43,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.nn.attention.flex_attention import create_block_mask
 
@@ -197,7 +198,50 @@ class CausalEditSelfAttention(CausalWanSelfAttention):
     the same unmasked flash-attention kernel as the original Wan/Bernini model.
     """
 
-    def forward_edit(self, x, region_specs, base_freqs, vid_table, block_mask):
+    def _ref_source_ranking_loss(self, q, k, ctx):
+        """Fraction of ref-vs-source attention mass the edit queries give to source."""
+        zero = q.sum() * 0.0
+        if not ctx:
+            return torch.stack((zero, zero, zero, zero))
+        sf, sh, sw = ctx["source_shape"]
+        tf, th, tw = ctx["target_shape"]
+        if (sf, sh, sw) != (tf, th, tw) or ctx["ref_end"] <= ctx["ref_start"]:
+            return torch.stack((zero, zero, zero, zero))
+        mask = ctx["mask"].reshape(q.shape[0], -1)
+        k_ref = k[:, ctx["ref_start"]:ctx["ref_end"]]
+        scale = self.head_dim ** -0.5
+        losses, ref_means, src_means, deltas = [], [], [], []
+        for bi in range(q.shape[0]):
+            edit_idx = torch.nonzero(mask[bi] > 0.5, as_tuple=False).flatten()
+            if edit_idx.numel() == 0:
+                continue
+            max_queries = int(ctx.get("max_queries", 2048))
+            if max_queries > 0 and edit_idx.numel() > max_queries:
+                stride = math.ceil(edit_idx.numel() / max_queries)
+                edit_idx = edit_idx[::stride][:max_queries]
+            query = q[bi, ctx["noisy_start"] + edit_idx]
+            source = k[bi, ctx["source_start"] + edit_idx]
+            ref = k_ref[bi]
+            topk = min(int(ctx.get("topk", 16)), ref.shape[0])
+            chunk_size = max(1, int(ctx.get("query_chunk", 128)))
+            ref_scores = []
+            for query_chunk in query.split(chunk_size, dim=0):
+                logits = torch.einsum("qhd,rhd->qhr", query_chunk.float(), ref.float()) * scale
+                top = logits.topk(topk, dim=-1).values
+                ref_scores.append(torch.logsumexp(top, dim=-1) - math.log(topk))
+            ref_score = torch.cat(ref_scores, dim=0)
+            src_score = (query.float() * source.float()).sum(dim=-1) * scale
+            ref_score, src_score = ref_score.mean(dim=-1), src_score.mean(dim=-1)
+            delta = ref_score - src_score
+            losses.append(torch.sigmoid(float(ctx.get("margin", 0.0)) - delta).mean())
+            ref_means.append(ref_score.mean()); src_means.append(src_score.mean()); deltas.append(delta.mean())
+        if not losses:
+            return torch.stack((zero, zero, zero, zero))
+        return torch.stack((torch.stack(losses).mean(), torch.stack(ref_means).mean(),
+                            torch.stack(src_means).mean(), torch.stack(deltas).mean()))
+
+    def forward_edit(self, x, region_specs, base_freqs, vid_table, block_mask,
+                     attn_loss_ctx=None):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)
@@ -218,9 +262,11 @@ class CausalEditSelfAttention(CausalWanSelfAttention):
         # and applies ordinary full self-attention, without an edit mask. Keep the
         # source-id RoPE above, but otherwise use the original unmasked attention
         # kernel so source/ref/target queries can all attend to one another.
+        attn_aux = (self._ref_source_ranking_loss(roped_q, roped_k, attn_loss_ctx)
+                    if attn_loss_ctx is not None else None)
         if block_mask is None:
-            out = flash_attention(q=roped_q, k=roped_k, v=v)
-            return self.o(out.flatten(2))
+            out = self.o(flash_attention(q=roped_q, k=roped_k, v=v).flatten(2))
+            return (out, attn_aux) if attn_aux is not None else out
 
         padded_length = math.ceil(s / 128) * 128 - s
         if padded_length > 0:
@@ -238,8 +284,8 @@ class CausalEditSelfAttention(CausalWanSelfAttention):
         )
         if padded_length > 0:
             out = out[:, :, :-padded_length]
-        out = out.transpose(2, 1).flatten(2)
-        return self.o(out)
+        out = self.o(out.transpose(2, 1).flatten(2))
+        return (out, attn_aux) if attn_aux is not None else out
 
     def forward_edit_stream(self, x, f, h, w, base_freqs, vid, start_frame,
                             self_cache: "EditKVCache", current_start,
@@ -283,22 +329,79 @@ class CausalEditSelfAttention(CausalWanSelfAttention):
 class CausalEditAttentionBlock(CausalWanAttentionBlock):
     """Edit attention block: modulation + edit self-attn + (unchanged) cross-attn/ffn."""
 
-    def forward_edit(self, x, e, region_specs, base_freqs, vid_table, context, block_mask):
-        # e: [B, F_total, 6, C]; modulation broadcasts per latent frame.
-        num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
+
+    @staticmethod
+    def _region_adaln(x, shift, scale, region_specs):
+        """Apply per-frame AdaLN without assuming equal spatial tokens per region."""
+        pieces = []
+        token_start = frame_start = 0
+        for token_len, frames, height, width, _sid in region_specs:
+            spatial = height * width
+            if token_len != frames * spatial:
+                raise ValueError(
+                    f"invalid region spec: token_len={token_len}, "
+                    f"frames={frames}, height={height}, width={width}"
+                )
+            value = x[:, token_start:token_start + token_len].unflatten(
+                1, (frames, spatial)
+            )
+            region_shift = shift[:, frame_start:frame_start + frames]
+            region_scale = scale[:, frame_start:frame_start + frames]
+            pieces.append(
+                (value * (1 + region_scale) + region_shift).flatten(1, 2)
+            )
+            token_start += token_len
+            frame_start += frames
+        if token_start != x.shape[1] or frame_start != shift.shape[1]:
+            raise ValueError(
+                "region specs do not cover packed tokens/time embeddings: "
+                f"tokens={token_start}/{x.shape[1]}, "
+                f"frames={frame_start}/{shift.shape[1]}"
+            )
+        return torch.cat(pieces, dim=1)
+
+    @staticmethod
+    def _region_gate(x, gate, region_specs):
+        """Apply a per-frame residual gate to independently-sized regions."""
+        pieces = []
+        token_start = frame_start = 0
+        for token_len, frames, height, width, _sid in region_specs:
+            spatial = height * width
+            value = x[:, token_start:token_start + token_len].unflatten(
+                1, (frames, spatial)
+            )
+            region_gate = gate[:, frame_start:frame_start + frames]
+            pieces.append((value * region_gate).flatten(1, 2))
+            token_start += token_len
+            frame_start += frames
+        if token_start != x.shape[1] or frame_start != gate.shape[1]:
+            raise ValueError(
+                "region specs do not cover packed tokens/time embeddings: "
+                f"tokens={token_start}/{x.shape[1]}, "
+                f"frames={frame_start}/{gate.shape[1]}"
+            )
+        return torch.cat(pieces, dim=1)
+
+    def forward_edit(self, x, e, region_specs, base_freqs, vid_table, context, block_mask,
+                     attn_loss_ctx=None):
+        # e: [B, F_total, 6, C]. Regions may have different H/W, so their
+        # per-frame modulation must be broadcast using each region's own token grid.
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
 
         y = self.self_attn.forward_edit(
-            (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
-            region_specs, base_freqs, vid_table, block_mask,
+            self._region_adaln(self.norm1(x), e[0], e[1], region_specs),
+            region_specs, base_freqs, vid_table, block_mask, attn_loss_ctx,
         )
-        x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
+        attn_aux = None
+        if isinstance(y, tuple):
+            y, attn_aux = y
+        x = x + self._region_gate(y, e[2], region_specs)
 
         x = x + self.cross_attn(self.norm3(x), context, None, crossattn_cache=None)
         y = self.ffn(
-            (self.norm2(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2))
-        x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[5]).flatten(1, 2)
-        return x
+            self._region_adaln(self.norm2(x), e[3], e[4], region_specs))
+        x = x + self._region_gate(y, e[5], region_specs)
+        return (x, attn_aux) if attn_aux is not None else x
 
     def forward_edit_stream(self, x, e, f, h, w, base_freqs, vid, start_frame,
                             self_cache, current_start, context, crossattn_cache,
@@ -498,6 +601,8 @@ class CausalEditWanModel(CausalWanModel):
         cond_timestep: Optional[float] = None,
         clean_target: Optional[torch.Tensor] = None,   # teacher-forcing clean target history [B, C, F, H, W]
         aug_t: Optional[torch.Tensor] = None,          # timestep of the (optionally noised) clean history, [B, F] or None
+        ref_attn_mask: Optional[torch.Tensor] = None,
+        ref_attn_config: Optional[dict] = None,
     ) -> torch.Tensor:
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
@@ -525,6 +630,8 @@ class CausalEditWanModel(CausalWanModel):
         # the frame-aligned source-video stream (block-causal w.r.t. the target);
         # everything else (reference images) is a global, always-visible prefix.
         src_len = 0
+        primary_source = None
+        cond_offset = 0
         for entry in cond_latents:
             lat, sid = entry[0], entry[1]
             is_source = entry[2] if len(entry) > 2 else True
@@ -559,7 +666,10 @@ class CausalEditWanModel(CausalWanModel):
             region_times.append(region_t)
 
             if is_source:
+                if primary_source is None:
+                    primary_source = (cond_offset, f, h, w)
                 src_len += f * h * w
+            cond_offset += f * h * w
         cond_len = sum(rs[0] for rs in region_specs)
 
         # noisy target timestep (per-frame).
@@ -626,16 +736,39 @@ class CausalEditWanModel(CausalWanModel):
                     self.num_frame_per_block, self.local_attn_size, self.bidirectional)
             self._edit_block_mask_key = key
 
+        # ---- optional noisy-edit-query reference attention supervision -----
+        attn_loss_ctx, attn_layers = None, set()
+        if ref_attn_mask is not None and ref_attn_config and primary_source is not None and cond_len > src_len:
+            pooled_mask = F.adaptive_max_pool3d(
+                ref_attn_mask.to(device=device, dtype=torch.float32).permute(0, 2, 1, 3, 4),
+                output_size=(nf, nh, nw)).flatten(1)
+            source_start, sf, sh, sw = primary_source
+            attn_loss_ctx = {"mask": pooled_mask, "source_start": source_start,
+                "source_shape": (sf, sh, sw), "target_shape": (nf, nh, nw),
+                "ref_start": src_len, "ref_end": cond_len, "noisy_start": cond_len + clean_len,
+                "topk": int(ref_attn_config.get("topk", 16)),
+                "max_queries": int(ref_attn_config.get("max_queries", 2048)),
+                "query_chunk": int(ref_attn_config.get("query_chunk", 128)),
+                "margin": float(ref_attn_config.get("margin", 0.0))}
+            attn_layers = {int(i) for i in ref_attn_config.get("layers", ())}
+
         # ---- transformer blocks ------------------------------------------
         use_ckpt = torch.is_grad_enabled() and getattr(self, "gradient_checkpointing", False)
-        for blk in self.blocks:
+        attn_aux_by_layer = []
+        for layer_idx, blk in enumerate(self.blocks):
+            layer_ctx = attn_loss_ctx if layer_idx in attn_layers else None
             if use_ckpt:
-                hidden = torch.utils.checkpoint.checkpoint(
+                result = torch.utils.checkpoint.checkpoint(
                     blk.forward_edit, hidden, e0, region_specs, self.freqs,
-                    vid_table, ctx, self._edit_block_mask, use_reentrant=False)
+                    vid_table, ctx, self._edit_block_mask, layer_ctx, use_reentrant=False)
             else:
-                hidden = blk.forward_edit(
-                    hidden, e0, region_specs, self.freqs, vid_table, ctx, self._edit_block_mask)
+                result = blk.forward_edit(hidden, e0, region_specs, self.freqs, vid_table,
+                                          ctx, self._edit_block_mask, layer_ctx)
+            if layer_ctx is not None:
+                hidden, layer_aux = result
+                attn_aux_by_layer.append(layer_aux)
+            else:
+                hidden = result
 
         # ---- keep noisy target tokens only, decode -----------------------
         hidden = hidden[:, cond_len + clean_len:]
@@ -645,8 +778,10 @@ class CausalEditWanModel(CausalWanModel):
         hidden = self.head(hidden, e_target.unflatten(dim=0, sizes=t_target.shape).unsqueeze(2))
 
         grid = torch.tensor([[noisy_num_frames, noisy_h, noisy_w]], device=device).expand(b, 3)
-        out = self.unpatchify(hidden, grid)
-        return torch.stack(out)
+        out = torch.stack(self.unpatchify(hidden, grid))
+        if attn_aux_by_layer:
+            return out, torch.stack(attn_aux_by_layer)
+        return out
 
     # ================================================================
     # Streaming (KV-cache) edit forward — the real-time / self-rollout path.

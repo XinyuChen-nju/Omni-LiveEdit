@@ -30,38 +30,44 @@ from bernini_causvid.pipeline.edit_stream_common import ref_token_count
 from utils.wan_wrapper import WanTextEncoder, WanVAEWrapper
 
 
-def resize_ref_pixels(pixels: torch.Tensor, max_size: int, stride: int = 16):
+def resize_ref_pixels(
+    pixels: torch.Tensor,
+    max_size: int,
+    stride: int = 16,
+) -> torch.Tensor:
     """Aspect-preserving Bernini-style RGB resize before VAE encoding."""
     if pixels.ndim != 3:
         raise ValueError(f"reference pixels must be [C,H,W], got {tuple(pixels.shape)}")
     if max_size < stride:
         raise ValueError(f"ref max size must be >= {stride}, got {max_size}")
-
     import torch.nn.functional as F
-
     height, width = map(int, pixels.shape[-2:])
     scale = min(float(max_size) / max(height, width), 1.0)
-
     def snapped(value):
         return max(stride, int(round(value / stride)) * stride)
-
-    new_height = snapped(height * scale)
-    new_width = snapped(width * scale)
+    new_height, new_width = snapped(height * scale), snapped(width * scale)
     if max(new_height, new_width) > max_size:
         correction = float(max_size) / max(new_height, new_width)
-        new_height = snapped(new_height * correction)
-        new_width = snapped(new_width * correction)
-
+        new_height, new_width = snapped(new_height * correction), snapped(new_width * correction)
     batched = pixels.unsqueeze(0)
     if (new_height, new_width) == (height, width):
         return batched
-    return F.interpolate(
-        batched,
-        size=(new_height, new_width),
-        mode="bicubic",
-        align_corners=False,
-        antialias=True,
-    )
+    return F.interpolate(batched, size=(new_height, new_width), mode="bicubic",
+                         align_corners=False, antialias=True)
+
+
+def prepare_ref_pixels(
+    pixels: torch.Tensor,
+    max_size: int | None = None,
+) -> torch.Tensor:
+    """Batch Ref pixels without resizing unless a limit is explicitly requested."""
+    if pixels.ndim != 3:
+        raise ValueError(
+            f"reference pixels must be [C,H,W], got {tuple(pixels.shape)}"
+        )
+    if max_size is None:
+        return pixels.unsqueeze(0)
+    return resize_ref_pixels(pixels, max_size)
 
 
 def load_video(path, num_frames, size):
@@ -90,7 +96,7 @@ def main():
     ap.add_argument("--width", type=int, default=832)
     ap.add_argument(
         "--ref_max_size", type=int, default=None,
-        help="maximum RGB edge for refs; defaults to max(height, width)",
+        help="optional RGB edge limit for refs; omitted preserves the original grid",
     )
     ap.add_argument("--fps", type=int, default=16)
     # ---- spatial attention visualization (opt-in) ----------------------
@@ -134,11 +140,11 @@ def main():
     if args.refs:
         import imageio.v2 as imageio
         refs = []
-        ref_max_size = args.ref_max_size or max(args.height, args.width)
         for r in args.refs:
             img = imageio.imread(r)
             pi = torch.from_numpy(img[..., :3]).float().permute(2, 0, 1) / 127.5 - 1.0  # [3,H,W]
-            pi = resize_ref_pixels(pi, ref_max_size).unsqueeze(2)  # [1,3,1,Hr,Wr]
+            # Default: preserve the Ref pixel grid. Resizing is explicit opt-in.
+            pi = prepare_ref_pixels(pi, args.ref_max_size).unsqueeze(2)  # [1,3,1,Hr,Wr]
             refs.append(vae.encode_to_latent(pi.to(device, dtype)).to(dtype))
         cond["ref_latents"] = refs
 

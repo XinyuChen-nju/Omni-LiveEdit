@@ -17,9 +17,11 @@ teacher_forcing: true
 noise_augmentation_max_timestep: 100
 source_noise_max_timestep: 100
 source_timestep_mode: source
+ref_timestep: 0  # causal student ref time embedding; 0 = clean
 num_train_timestep: 1000
 denoising_loss_type: flow
-region_loss: true
+region_loss: false
+ref_attn_loss: false  # AR policy: clean Ref, no auxiliary attention/region losses
 region_edit_weight: 2.0
 region_mask_threshold: 0.1
 region_mask_soft: false

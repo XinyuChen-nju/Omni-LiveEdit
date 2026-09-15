@@ -40,6 +40,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.context_noise = getattr(args, "context_noise", 0)
         self.source_noise = getattr(args, "source_noise", 0)
+        self.ref_timestep = float(getattr(args, "ref_timestep", 0) or 0)
         self.source_timestep_mode = str(
             getattr(args, "source_timestep_mode", "source")).lower()
         if self.source_timestep_mode not in ("source", "target"):
@@ -70,7 +71,8 @@ class EditCausalInferencePipeline(torch.nn.Module):
         cond_cache, tgt_cache, crossattn_cache = alloc_edit_caches(
             self.generator, b, frame_seq, num_frames, ref_tokens, dtype, device)
         written_ref_tokens = prefill_refs(
-            self.generator, conditional_dict, refs, cond_cache, crossattn_cache
+            self.generator, conditional_dict, refs, cond_cache, crossattn_cache,
+            ref_timestep=self.ref_timestep,
         )
         if written_ref_tokens != ref_tokens:
             raise RuntimeError(

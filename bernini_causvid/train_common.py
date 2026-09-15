@@ -6,7 +6,23 @@ import re
 from datetime import datetime
 
 
+
 def find_latest(ckpt_dir):
+    """Prefer newest verified checkpoint; skip corrupt incomplete saves."""
+    try:
+        from bernini_causvid.train_state import find_latest_verified
+        path, step, reason = find_latest_verified(ckpt_dir)
+        if path is None:
+            return None, None
+        if reason == "legacy_no_manifest":
+            print(f"[ckpt] using legacy checkpoint without manifest: {path}")
+        return path, step
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ckpt] verified lookup failed ({exc}); falling back to existence scan")
+        return _find_latest_legacy(ckpt_dir)
+
+
+def _find_latest_legacy(ckpt_dir):
     """Return (path_to_model.pt, step) of the latest checkpoint, or (None, None)."""
     best, path = None, None
     for d in glob.glob(os.path.join(ckpt_dir, "checkpoint_model_*")):
