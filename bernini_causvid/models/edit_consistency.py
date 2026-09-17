@@ -103,7 +103,7 @@ class EditNaiveConsistency(nn.Module):
         }
         if "tv2v" not in self.guidance_mode_by_task_type and "v2v" in self.guidance_mode_by_task_type:
             self.guidance_mode_by_task_type["tv2v"] = self.guidance_mode_by_task_type["v2v"]
-        valid_modes = {"t2v", "v2v_apg", "rv2v_apg"}
+        valid_modes = {"t2v", "v2v", "v2v_apg", "rv2v_apg"}
         invalid_modes = sorted(set(self.guidance_mode_by_task_type.values()) - valid_modes)
         if invalid_modes:
             raise ValueError(f"unsupported CD guidance modes: {invalid_modes}")
@@ -182,6 +182,11 @@ class EditNaiveConsistency(nn.Module):
 
     def _cond_arg(self, clean):
         return clean if self.teacher_forcing else None
+
+    @staticmethod
+    def _plain_v2v_flow_cfg(eps_vi, eps_vti, omega_ti):
+        """Match BerniniTeacherModel's bidirectional plain-V2V flow CFG."""
+        return eps_vi + omega_ti * (eps_vti - eps_vi)
 
     def _resolve_guidance_mode(self, task_types, batch_size: int) -> str:
         if task_types is None:
@@ -312,6 +317,18 @@ class EditNaiveConsistency(nn.Module):
                     latent_t, unconditional_t, timestep,
                     clean_x=self._cond_arg(clean))
                 v_pred = v_uncond + self.guidance_scale * (v_cond - v_uncond)
+            elif guidance_mode == "v2v":
+                # Strictly mirror BerniniTeacherModel._predict_real_group(v2v):
+                # eps_vi uses negative text + all visual conditions; eps_vti
+                # uses positive text + the identical visual conditions.
+                eps_vi, _ = self.teacher(
+                    latent_t, unconditional_t, timestep,
+                    clean_x=self._cond_arg(clean))
+                eps_vti, _ = self.teacher(
+                    latent_t, conditional_t, timestep,
+                    clean_x=self._cond_arg(clean))
+                v_pred = self._plain_v2v_flow_cfg(
+                    eps_vi, eps_vti, self.omega_ti)
             elif guidance_mode == "v2v_apg":
                 _, x0_cond = self.teacher(
                     latent_t, conditional_t, timestep,

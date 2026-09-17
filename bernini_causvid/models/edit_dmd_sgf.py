@@ -109,6 +109,23 @@ class EditDMD(nn.Module):
             str(k).strip().lower(): str(v).strip().lower()
             for k, v in raw_mode_map.items()
         }
+        self.trace_teacher_guidance = bool(
+            getattr(config, "trace_teacher_guidance", False)
+        )
+        self._teacher_guidance_traced = False
+        if "tv2v" not in self.guidance_mode_by_task_type and "v2v" in self.guidance_mode_by_task_type:
+            self.guidance_mode_by_task_type["tv2v"] = self.guidance_mode_by_task_type["v2v"]
+        required_tasks = ("t2v", "v2v", "rv2v")
+        missing = [t for t in required_tasks if t not in self.guidance_mode_by_task_type]
+        if missing:
+            raise ValueError(
+                "guidance_mode_by_task_type missing required tasks: "
+                + ", ".join(missing))
+        self.ref_timestep = float(getattr(config, "ref_timestep", 0) or 0)
+        if abs(self.ref_timestep) > 1e-8:
+            raise ValueError(
+                f"causal student ref_timestep must be 0 (persistent KV cache), got {self.ref_timestep}")
+
 
         # Full ReCo indexes already carry precomputed prompt embeddings. Matching
         # Stage 1/2, skip constructing umT5 entirely in that mode (~11 GB/rank
@@ -184,9 +201,9 @@ class EditDMD(nn.Module):
             num_frame_per_block=nfpb,
             context_noise=getattr(config, "context_noise", 0),
             source_noise=getattr(config, "source_noise", 0),
-            ref_timestep=getattr(config, "ref_timestep", 0),
+            ref_timestep=0.0,  # causal student KV cache: always clean ref time
             source_timestep_mode=getattr(
-                config, "source_timestep_mode", "target"
+                config, "source_timestep_mode", "source"
             ),
             same_step_across_blocks=True)
         self.num_train_timestep = getattr(config, "num_train_timestep", 1000)
@@ -216,11 +233,23 @@ class EditDMD(nn.Module):
         return self._shift_ts(ts)
 
     def _resolve_guidance_modes(self, task_types):
+        if task_types is None:
+            raise ValueError("DMD guidance requires batch task_types")
         modes = []
-        for task in task_types:
-            key = str(task or "").strip().lower()
-            mode = self.guidance_mode_by_task_type.get(
-                key, self.default_guidance_mode)
+        for raw in task_types:
+            key = str(raw or "").strip().lower()
+            if key == "tv2v":
+                key = "v2v"
+            if key == "s2v":
+                raise NotImplementedError(
+                    "s2v guidance is reserved but not implemented")
+            if key not in self.guidance_mode_by_task_type:
+                raise ValueError(
+                    f"no guidance_mode mapped for task_type {key!r}; "
+                    f"configured={sorted(self.guidance_mode_by_task_type)}")
+            mode = str(self.guidance_mode_by_task_type[key]).strip().lower()
+            if mode == "s2v_apg":
+                raise NotImplementedError("s2v_apg is reserved but not implemented")
             modes.append(mode)
         return modes
 
@@ -240,6 +269,9 @@ class EditDMD(nn.Module):
         timestep. ``source`` mode is retained as an explicit ablation.
         """
         cond = dict(conditional_dict)
+        # Bidirectional critic: Ref follows current score/noise
+        # timestep via backbone None->target fallback.
+        cond.pop("ref_timesteps", None)
         src = conditional_dict.get("source_latents", None)
         src = src if isinstance(src, list) else ([src] if src is not None else [])
         if self.score_source_timestep_mode == "target":
@@ -276,6 +308,19 @@ class EditDMD(nn.Module):
         guidance_modes = (
             self._resolve_guidance_modes(task_types)
             if task_types is not None else None)
+        if self.trace_teacher_guidance and not self._teacher_guidance_traced:
+            expected = ["rv2v_apg"] * len(guidance_modes or [])
+            if guidance_modes != expected:
+                raise RuntimeError(
+                    "SGF smoke expected every teacher path to use rv2v_apg, "
+                    f"got {guidance_modes}"
+                )
+            print(
+                "[SGF_TRACE] teacher_guidance=rv2v_apg "
+                "flow_paths=x0_0->x0_v->x0_vi->x0_vti count=4",
+                flush=True,
+            )
+            self._teacher_guidance_traced = True
         pred_real = self.real_score.predict_real(
             noisy_image_or_video=noisy, timestep=timestep,
             text_cond=conditional_dict["prompt_embeds"],

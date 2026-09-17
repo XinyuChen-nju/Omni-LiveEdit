@@ -131,6 +131,20 @@ def _decode_latent_to_mp4(model, latent, device, dtype, out_path):
     write_video(out_path, vid, fps=16)
 
 
+def resolve_progress_sample_settings(config, cli_sample_steps):
+    """Return the validated deterministic progress-sampling policy."""
+    mode = str(getattr(config, "progress_sample_mode", "flow")).strip().lower()
+    if mode != "flow":
+        raise ValueError(
+            "progress_sample_mode must be 'flow'; target random-noise visualization is disabled")
+    configured_steps = int(getattr(
+        config, "progress_sample_steps", getattr(config, "discrete_cd_N", 4)))
+    steps = configured_steps if int(cli_sample_steps) <= 0 else int(cli_sample_steps)
+    if steps < 1:
+        raise ValueError(f"progress sample steps must be >= 1, got {steps}")
+    return mode, steps
+
+
 @torch.no_grad()
 def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_scheduler,
                 device, dtype, out_path, is_main, sample_steps=-1,
@@ -141,9 +155,10 @@ def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_sche
     sequence; only rank0 decodes and writes the video.
     """
     cond, _ = build_cond(eval_batch)
-    steps = int(getattr(model.config, "discrete_cd_N", 4)) if sample_steps <= 0 else int(sample_steps)
+    _sample_mode, steps = resolve_progress_sample_settings(
+        model.config, sample_steps)
 
-    # Build the same shifted few-step schedule used by streamed Causal Forcing.
+    # Build the same shifted flow-ODE schedule used by streamed Causal Forcing.
     sample_scheduler.set_timesteps(
         num_inference_steps=steps,
         denoising_strength=1.0,
@@ -176,7 +191,8 @@ def save_sample(model, eval_batch, build_cond, image_or_video_shape, sample_sche
     if sample_latent is None:
         raise RuntimeError("sampling needs a source or target latent for output shape")
 
-    # 同一个评测样本在不同训练 step 使用相同的初始噪声。
+    # Flow generation still requires a Gaussian ODE starting state. This is a
+    # fixed per-sample seed and is not target-latent random add-noise sampling.
     noise_generator = torch.Generator(device=device)
     noise_generator.manual_seed(int(sample_seed))
     noise = torch.randn(
@@ -221,7 +237,7 @@ def main():
     ap.add_argument("--sample_every", type=int, default=-1,
                     help="decode a sample video every N steps; -1 ties it to --save_every, 0 disables")
     ap.add_argument("--sample_steps", type=int, default=-1,
-                    help="inference steps for the progress sample; -1 = config discrete_cd_N")
+                    help="inference steps for the progress sample; -1 = config progress_sample_steps")
     args = ap.parse_args()
 
     dist_info = D.init_distributed()

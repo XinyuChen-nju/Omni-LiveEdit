@@ -1,0 +1,69 @@
+# H1 Stage-2 CD: same TripVVT-short + Eevee RV2V data as the AR run.
+model_name: Bernini-R-1.3B
+model_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Bernini-R-1.3B-Wan
+text_encoder_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+vae_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+
+causal: true
+num_frame_per_block: 3
+timestep_shift: 5.0
+cache_text_embeds: true
+teacher_forcing: true
+source_timestep_mode: source
+ref_timestep: 0
+noise_augmentation_max_timestep: 100
+source_noise_max_timestep: 100
+num_train_timestep: 1000
+denoising_loss_type: flow
+discrete_cd_N: 48
+
+# RV2V samples keep source + Ref conditioning, but teacher guidance is plain
+# flow-space V2V CFG. No RV2V APG branch is used.
+# Matches BerniniTeacherModel plain-v2v: eps_vi + omega_ti*(eps_vti-eps_vi).
+omega_ti: 4.0
+guidance_mode_by_task_type:
+  rv2v: v2v
+
+# Progress samples use the flow inference pipeline, never target add-noise.
+progress_sample_mode: flow
+progress_sample_steps: 4
+
+generator_ckpt: /opt/dlami/nvme/chenxinyu/project/Universal-Edit-Forcing/runs/ar_vvtshort_eevee_ref6m4k_init_zero2_ga2/20260910_094139/checkpoints/checkpoint_model_003000/model.pt
+
+region_loss: false
+image_or_video_shape: [1, 21, 16, 90, 68]
+mixed_precision: true
+gradient_checkpointing: true
+batch_size: 1
+gradient_accumulation_steps: 1
+lr: 5.0e-7
+beta1: 0.0
+beta2: 0.999
+weight_decay: 0.0
+ema_weight: 0.99
+ema_start_step: 0
+seed: 0
+sharding_strategy: grad_op
+
+data_path: /opt/dlami/nvme/chenxinyu/data/Universal-Edit-Metadata/mixed_train/index_rv2v_vvtshort_eevee_garment_dedup.json
+dataset_sampling_weights:
+  tripvvt: 5998
+  eevee: 9357
+dataset_max_lat_frames:
+  tripvvt: 21
+  eevee: 21
+
+eval_samples:
+  - name: rv2v_vvtshort
+    dataset: tripvvt
+    task_type: rv2v
+    edit_type: tryon
+    count: 5
+  - name: rv2v_eevee
+    dataset: eevee
+    task_type: rv2v
+    edit_type: tryon
+    count: 5
+
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
