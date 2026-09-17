@@ -1,8 +1,10 @@
 __pycache__
 *.egg-info
+.cursor/
 
 wan_models
 checkpoints
+weights/
 output
 dataset
 prompts/vidprom_filtered_extended.txt
@@ -27,3 +29,9 @@ results/
 *.npz
 *.pth.tar
 *.pptx
+
+# local backup files
+*.bak
+*.bak.*
+*.backup
+*.backup.*
