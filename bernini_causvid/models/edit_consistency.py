@@ -96,14 +96,14 @@ class EditNaiveConsistency(nn.Module):
             "v2v": "v2v_apg",
             "tv2v": "v2v_apg",
             "i2i": "v2v_apg",
-            "rv2v": "rv2v_apg",
+            "rv2v": "rv2v",
         }
         self.guidance_mode_by_task_type = {
             str(k).strip().lower(): str(v).strip().lower() for k, v in dict(raw_mode_map).items()
         }
         if "tv2v" not in self.guidance_mode_by_task_type and "v2v" in self.guidance_mode_by_task_type:
             self.guidance_mode_by_task_type["tv2v"] = self.guidance_mode_by_task_type["v2v"]
-        valid_modes = {"t2v", "v2v", "v2v_apg", "rv2v_apg"}
+        valid_modes = {"t2v", "v2v", "v2v_apg", "rv2v"}
         invalid_modes = sorted(set(self.guidance_mode_by_task_type.values()) - valid_modes)
         if invalid_modes:
             raise ValueError(f"unsupported CD guidance modes: {invalid_modes}")
@@ -250,17 +250,6 @@ class EditNaiveConsistency(nn.Module):
         return pred_uncond + scale * self._apg_delta(
             pred_cond, pred_uncond, norm_threshold)
 
-    def _apg_chain(self, pred_uncond, preds, scales, norm_thresholds):
-        """Bernini chain: each projected delta uses the previous condition."""
-        if not (len(preds) == len(scales) == len(norm_thresholds)):
-            raise ValueError("APG chain predictions, scales, and thresholds must align")
-        result = pred_uncond
-        previous = pred_uncond
-        for pred_cond, scale, threshold in zip(preds, scales, norm_thresholds):
-            result = result + scale * self._apg_delta(
-                pred_cond, previous, threshold)
-            previous = pred_cond
-        return result
 
     @staticmethod
     def _share_edit_block_mask(source_wrapper, target_wrapper):
@@ -343,37 +332,38 @@ class EditNaiveConsistency(nn.Module):
                     self.scheduler, x0_guided.flatten(0, 1),
                     latent_t.flatten(0, 1), timestep.flatten(0, 1),
                 ).unflatten(0, (b, f))
-            elif guidance_mode == "rv2v_apg":
-                if not conditional_t.get("source_latents"):
-                    raise ValueError("rv2v_apg requires source_latents")
-                if not conditional_t.get("ref_latents"):
-                    raise ValueError("rv2v_apg requires ref_latents")
+            elif guidance_mode == "rv2v":
+                if conditional_t.get("source_latents") is None:
+                    raise ValueError("rv2v requires source_latents")
+                if conditional_t.get("ref_latents") is None:
+                    raise ValueError("rv2v requires ref_latents")
+                # Official Bernini-R four-way RV2V guidance:
+                # f0=negative text, fV=negative text+source,
+                # fVI=negative text+source+ref, fVTI=positive text+source+ref.
                 cond_0 = self._visual_subset(
                     unconditional_t, source=False, refs=False)
                 cond_v = self._visual_subset(
                     unconditional_t, source=True, refs=False)
                 cond_vi = self._visual_subset(
                     unconditional_t, source=True, refs=True)
-                _, x0_0 = self.teacher(
+                eps_0, _ = self.teacher(
                     latent_t, cond_0, timestep,
                     clean_x=self._cond_arg(clean))
-                _, x0_v = self.teacher(
+                eps_v, _ = self.teacher(
                     latent_t, cond_v, timestep,
                     clean_x=self._cond_arg(clean))
-                _, x0_vi = self.teacher(
+                eps_vi, _ = self.teacher(
                     latent_t, cond_vi, timestep,
                     clean_x=self._cond_arg(clean))
-                _, x0_vti = self.teacher(
+                eps_vti, _ = self.teacher(
                     latent_t, conditional_t, timestep,
                     clean_x=self._cond_arg(clean))
-                x0_guided = self._apg_chain(
-                    x0_0, (x0_v, x0_vi, x0_vti),
-                    (self.omega_v, self.omega_i, self.omega_ti),
-                    self.apg_norm_thresholds)
-                v_pred = EditDiffusionWrapper._convert_x0_to_flow_pred(
-                    self.scheduler, x0_guided.flatten(0, 1),
-                    latent_t.flatten(0, 1), timestep.flatten(0, 1),
-                ).unflatten(0, (b, f))
+                v_pred = (
+                    eps_0
+                    + self.omega_v * (eps_v - eps_0)
+                    + self.omega_i * (eps_vi - eps_v)
+                    + self.omega_ti * (eps_vti - eps_vi)
+                )
             else:
                 raise RuntimeError(f"unreachable guidance_mode {guidance_mode!r}")
 

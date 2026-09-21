@@ -5,9 +5,11 @@
 #   单机 8 卡（默认）： bash bernini_causvid/scripts/4_stage3_train_dmd.sh
 #   多机：             用 bernini_causvid/multinode/launch.sh 一键拉起（推荐）
 set -e
-CF_ROOT="/opt/dlami/nvme/chenxinyu/project/Causal-Forcing"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CF_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PY="${PY:-/opt/conda/envs/causvid/bin/python}"
 cd "$CF_ROOT"
+export PYTHONPATH="$CF_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 # 训练超参：均可用同名环境变量覆盖（多机时由 launch.sh 统一下发）。
 CONFIG="${CONFIG:-bernini_causvid/configs/causvid_edit_dmd_1.3b_chunk3.yaml}"

@@ -82,7 +82,8 @@ def barrier():
 
 
 def fsdp_wrap_single(module: torch.nn.Module, sharding_strategy: str = "full",
-                     mixed_precision: bool = True, cpu_offload: bool = False) -> FSDP:
+                     mixed_precision: bool = True, cpu_offload: bool = False,
+                     use_orig_params: bool = True) -> FSDP:
     """Wrap `module` as a SINGLE FSDP unit (no nested auto-wrap).
 
     Critical for the edit models, which are driven via `forward_edit` (see module
@@ -125,7 +126,7 @@ def fsdp_wrap_single(module: torch.nn.Module, sharding_strategy: str = "full",
         mixed_precision=mp,
         device_id=torch.cuda.current_device(),
         limit_all_gathers=True,
-        use_orig_params=True,
+        use_orig_params=use_orig_params,
         cpu_offload=CPUOffload(offload_params=cpu_offload),
         sync_module_states=False,                    # each rank builds identical weights
     )

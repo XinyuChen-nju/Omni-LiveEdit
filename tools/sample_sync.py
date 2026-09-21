@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import requests
 import yaml
@@ -25,9 +25,12 @@ import yaml
 LOG = logging.getLogger("sample-sync")
 STOP = False
 STEP_RE = re.compile(r"^step_(\d+)_(.+)\.mp4$")
+CAUSAL_H3_STEP_RE = re.compile(r"^step-(\d+)-eval-(\d+)\.mp4$")
+CAUSAL_H3_CPU_STEP_RE = re.compile(r"^step-(\d+)-eval-(\d+)-cpu\.mp4$")
 
 DEFAULTS = {
     "runs_root": "/opt/dlami/nvme/chenxinyu/project/Universal-Edit-Forcing/runs",
+    "causal_h3_runs_root": "/opt/dlami/nvme/chenxinyu/project/CausalH3/runs",
     "cos_base_url": "http://open-api-oversea.xrtm-infra.com",
     "data_srv_url": "http://140.207.124.187",
     "dataset_name": "universal-edit-training-eval",
@@ -96,6 +99,9 @@ def load_config(path: Path) -> dict:
             raise ValueError("configuration root must be a mapping")
         config.update(loaded)
     config["runs_root"] = str(Path(config["runs_root"]).resolve())
+    config["causal_h3_runs_root"] = str(
+        Path(config["causal_h3_runs_root"]).resolve()
+    )
     return config
 
 
@@ -111,14 +117,31 @@ def parse_step_file(path: Path) -> Optional[Tuple[int, str, str]]:
     return step, rest, "result_video"
 
 
-def media_for(path: Path, config: dict, experiment: str, run_id: str) -> MediaFile:
+def media_for(
+    path: Path,
+    config: dict,
+    experiment: str,
+    run_id: str,
+    *,
+    source_namespace: Optional[str] = None,
+    relative_path: Optional[PurePosixPath] = None,
+) -> MediaFile:
     stat = path.stat()
-    key = str(PurePosixPath(config["cos_prefix"]) / experiment / run_id / path.name)
+    key = PurePosixPath(config["cos_prefix"])
+    if source_namespace:
+        key /= source_namespace
+    key /= PurePosixPath(experiment) / run_id
+    key /= relative_path or PurePosixPath(path.name)
+    key = str(key)
     return MediaFile(path, key, stat.st_size, stat.st_mtime_ns)
 
 
-def discover_rows(config: dict, experiment_filter=None, run_filter=None) -> Iterable[CaseRow]:
-    root = Path(config["runs_root"])
+def discover_universal_rows(
+    config: dict,
+    root: Path,
+    experiment_filter=None,
+    run_filter=None,
+) -> Iterable[CaseRow]:
     if not root.is_dir():
         return
     for experiment_dir in sorted(root.iterdir()):
@@ -173,6 +196,126 @@ def discover_rows(config: dict, experiment_filter=None, run_filter=None) -> Iter
                     metadata=metadata.get(case_name, {}),
                     media=media,
                 )
+
+
+def causal_h3_result_files(samples: Path) -> Dict[Tuple[int, int], Tuple[Path, PurePosixPath]]:
+    results = {}
+    for path in samples.glob("step-*-eval-*.mp4"):
+        match = CAUSAL_H3_STEP_RE.match(path.name)
+        if not match:
+            continue
+        status_path = path.with_suffix(".decode_status.json")
+        if status_path.is_file():
+            try:
+                if not json.loads(status_path.read_text()).get("ok"):
+                    continue
+            except (json.JSONDecodeError, OSError):
+                continue
+        if not path.with_suffix(".pt").is_file():
+            continue
+        results[(int(match.group(1)), int(match.group(2)))] = (
+            path,
+            PurePosixPath(path.name),
+        )
+
+    cpu_dir = samples / "cpu_decoded"
+    if cpu_dir.is_dir():
+        for path in cpu_dir.glob("step-*-eval-*-cpu.mp4"):
+            match = CAUSAL_H3_CPU_STEP_RE.match(path.name)
+            if not match:
+                continue
+            key = (int(match.group(1)), int(match.group(2)))
+            latent_path = samples / f"step-{key[0]:09d}-eval-{key[1]:06d}.pt"
+            if key not in results and latent_path.is_file():
+                results[key] = (
+                    path,
+                    PurePosixPath("cpu_decoded") / path.name,
+                )
+    return results
+
+
+def discover_causal_h3_rows(
+    config: dict,
+    root: Path,
+    experiment_filter=None,
+    run_filter=None,
+) -> Iterable[CaseRow]:
+    if not root.is_dir():
+        return
+    for experiment_dir in sorted(root.iterdir()):
+        if not experiment_dir.is_dir() or experiment_dir.name.startswith("."):
+            continue
+        experiment = experiment_dir.name
+        if experiment_filter and experiment != experiment_filter:
+            continue
+        for run_dir in sorted(experiment_dir.iterdir()):
+            if run_filter and run_dir.name != run_filter:
+                continue
+            samples = run_dir / "artifacts" / "rollout_samples"
+            if not samples.is_dir():
+                continue
+            condition_dir = samples / "fixed_conditions"
+            for (step, eval_index), (result_path, result_relative) in sorted(
+                causal_h3_result_files(samples).items()
+            ):
+                case_name = f"eval-{eval_index:06d}"
+                candidates = (
+                    ("source_video", condition_dir / f"{case_name}-source.mp4"),
+                    ("target_video", condition_dir / f"{case_name}-target.mp4"),
+                    (
+                        "reference_video",
+                        condition_dir / f"{case_name}-garment-reference.jpg",
+                    ),
+                )
+                media = {
+                    "result_video": media_for(
+                        result_path,
+                        config,
+                        experiment,
+                        run_dir.name,
+                        source_namespace="causal_h3",
+                        relative_path=result_relative,
+                    )
+                }
+                for role, path in candidates:
+                    if path.is_file():
+                        media[role] = media_for(
+                            path,
+                            config,
+                            experiment,
+                            run_dir.name,
+                            source_namespace="causal_h3",
+                            relative_path=PurePosixPath("fixed_conditions") / path.name,
+                        )
+                yield CaseRow(
+                    sample_id=(
+                        f"causal_h3:{experiment}:{run_dir.name}:"
+                        f"{step:09d}:{case_name}"
+                    ),
+                    experiment=experiment,
+                    run_id=run_dir.name,
+                    train_step=step,
+                    case_name=case_name,
+                    metadata={
+                        "task_type": "rv2v",
+                        "edit_type": "tryon",
+                        "dataset": experiment,
+                        "index": eval_index,
+                    },
+                    media=media,
+                )
+
+
+def discover_rows(config: dict, experiment_filter=None, run_filter=None) -> Iterable[CaseRow]:
+    yield from discover_universal_rows(
+        config, Path(config["runs_root"]), experiment_filter, run_filter
+    )
+    yield from discover_causal_h3_rows(
+        config,
+        Path(config["causal_h3_runs_root"]),
+        experiment_filter,
+        run_filter,
+    )
 
 
 class StateStore:

@@ -31,6 +31,7 @@ import os
 import socket
 import sys
 import time
+import traceback
 from datetime import datetime
 
 sys.path.insert(0, os.getcwd())
@@ -140,12 +141,13 @@ def save_sample(model, sample_batch, build_cond, device, dtype, out_path,
         sample_latent = sample_batch.get("target_latent")
     if sample_latent is None:
         raise RuntimeError("sampling needs a source or target latent for output shape")
-    rng = torch.Generator(device=sample_latent.device)
+    sample_latent = sample_latent.to(device=device, dtype=dtype)
+    rng = torch.Generator(device=device)
     rng.manual_seed(int(sample_seed))
     noise = torch.randn(
         sample_latent.shape,
-        device=sample_latent.device,
-        dtype=sample_latent.dtype,
+        device=device,
+        dtype=dtype,
         generator=rng,
     )
     denoised = pipeline.inference(
@@ -281,8 +283,14 @@ def main():
 
     if distributed:
         # trainable nets: fp32 master + FSDP MixedPrecision (bf16 compute).
+        # SGF's no-grad rollout followed by differentiable dense replay produces
+        # gradients on FSDP's flat parameter. On H1/PyTorch 2.6, use_orig_params
+        # does not write those gradients back to the exposed original parameters,
+        # leaving the optimizer with 825 grad=None tensors. Optimize the managed
+        # flat parameter directly for the SGF generator.
         model.generator = D.fsdp_wrap_single(
-            model.generator.float(), sharding, cfg.mixed_precision)
+            model.generator.float(), sharding, cfg.mixed_precision,
+            use_orig_params=False)
         model.fake_score = D.fsdp_wrap_single(
             model.fake_score.float(), sharding, cfg.mixed_precision)
         if model.real_score.is_dual_expert:
@@ -523,7 +531,7 @@ def main():
             except Exception as e:  # sampling must never kill training
                 log(
                     f"[train] sample '{kind}' failed at step "
-                    f"{sample_step}: {e}"
+                    f"{sample_step}: {e}\n{traceback.format_exc()}"
                 )
         if is_main and sample_mses:
             mean_mse = sum(sample_mses.values()) / len(sample_mses)
@@ -569,26 +577,22 @@ def main():
                 accum_dmd_grad_norm += float(
                     gen_log["dmdtrain_gradient_norm"]
                 )
-            gnorm = D.clip_grad_norm_(model.generator, 10.0, distributed)
-            if os.environ.get("GRAD_DIAG"):
+            if distributed:
+                # SGF performs several no-grad streaming forwards before its
+                # differentiable dense replay. PyTorch 2.6 FSDP can miss the
+                # root post-backward reduce-scatter in this multi-forward shape.
                 import torch.distributed as _dist
-                _sq, _ng, _np, _mx = 0.0, 0, 0, 0.0
-                for _p in model.generator.parameters():
-                    _np += 1
-                    if _p.grad is not None and _p.grad.numel() > 0:
-                        _ng += 1
-                        _g = _p.grad.detach().float()
-                        _sq += _g.pow(2).sum().item()
-                        _mx = max(_mx, _g.abs().max().item())
-                if _dist.is_initialized():
-                    _t = torch.tensor([_sq], device=next(model.generator.parameters()).device)
-                    _dist.all_reduce(_t)
-                    _sq = _t.item()
-                if (not _dist.is_initialized()) or _dist.get_rank() == 0:
-                    print(f"[grad_diag] local_shards_with_grad={_ng}/{_np} "
-                          f"global_pre_clip_norm={_sq ** 0.5:.6e} "
-                          f"local_max_abs={_mx:.6e} clip_returned={float(gnorm):.6e}",
-                          flush=True)
+                world = _dist.get_world_size()
+                for param in model.generator.parameters():
+                    grad = param.grad
+                    if grad is not None and grad.numel() == param.numel() * world:
+                        reduced = torch.empty_like(param)
+                        _dist.reduce_scatter_tensor(
+                            reduced, grad.detach().float().contiguous(),
+                            op=_dist.ReduceOp.SUM)
+                        reduced.div_(world)
+                        param.grad = reduced
+            gnorm = D.clip_grad_norm_(model.generator, 10.0, distributed)
             gen_opt.step()
             last_gen_loss = accum_gen_loss / grad_accum
             last_grad_norm = float(gnorm)
@@ -647,6 +651,13 @@ def main():
                 )
                 writer.add_scalar("train/sec_per_window", dt, step)
 
+        # Sample before checkpoint gathering. FULL_STATE_DICT uses CPU offload;
+        # with flat FSDP params it can leave the just-used parameter views on CPU
+        # until the next training forward, making FlashAttention see a CPU K.
+        if sample_every and step % sample_every == 0:
+            write_progress_samples(step)
+            D.barrier()
+
         if step % args.save_every == 0:
             # state-dict gathers are collectives: all ranks must call together.
             gen_sd = D.full_state_dict(model.generator, distributed)
@@ -666,9 +677,6 @@ def main():
                 log(f"[train] saved {d}/model.pt (+optim"
                     + ("+ema)" if ema_sd is not None else ")"))
             D.barrier()
-
-        if sample_every and step % sample_every == 0:
-            write_progress_samples(step)
 
     log("[train] done")
     if writer is not None:

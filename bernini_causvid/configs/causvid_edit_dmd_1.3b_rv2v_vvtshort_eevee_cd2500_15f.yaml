@@ -1,0 +1,94 @@
+independent_first_frame: false
+warp_denoising_step: true
+weight_decay: 0.0
+same_step_across_blocks: true
+discriminator_lr_multiplier: 1.0
+last_step_only: false
+i2v: false
+num_training_frames: 15
+gc_interval: 100
+context_noise: 0
+causal: true
+ckpt_step: 0
+prompt_name: MovieGenVideoBench
+prompt_path: prompts/MovieGenVideoBench.txt
+eval_first_n: 64
+num_samples: 1
+height: 480
+width: 832
+num_frames: 57
+model_name: Bernini-R-1.3B
+model_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Bernini-R-1.3B-Wan
+text_encoder_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+tokenizer_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl
+vae_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+num_frame_per_block: 3
+timestep_shift: 5.0
+teacher_model_name: Bernini-R-14B
+teacher_model_path: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Bernini-R-14B-high
+teacher_model_path_low: /opt/dlami/nvme/chenxinyu/project/Causal-Forcing/wan_models/Bernini-R-14B-low
+teacher_switch_boundary: 875
+teacher_omega_scale: 0.75
+teacher_load_in_mixed_precision: true
+teacher_sharding_strategy: full
+teacher_cpu_offload: true
+cache_text_embeds: true
+generator_ckpt: /opt/dlami/nvme/chenxinyu/project/Universal-Edit-Forcing/runs/cd_rv2v_vvtshort_eevee_ar3000_v2v_flow/20260915_134052/checkpoints/checkpoint_model_002500/model.pt
+fake_score_init: teacher
+allow_raw_bernini_init: false
+source_timestep_mode: source
+ref_timestep: 0
+source_noise: 0
+score_source_timestep_mode: target
+score_causal_source: false
+guidance_mode: v2v_apg
+guidance_mode_by_task_type:
+  t2v: t2v
+  v2v: v2v_apg
+  rv2v: rv2v
+guidance_scale: 3.0
+omega_v: 1.25
+omega_i: 4.5
+omega_ti: 4.0
+apg_eta: 0.5
+apg_norm_threshold: 50.0
+distribution_loss: dmd
+trainer: score_distillation
+denoising_loss_type: flow
+denoising_step_list:
+- 1000
+- 500
+ts_schedule: false
+min_score_timestep: 0
+num_train_timestep: 1000
+generator_start_step: 0
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 15
+- 16
+- 60
+- 104
+mixed_precision: true
+gradient_checkpointing: true
+batch_size: 1
+gradient_accumulation_steps: 1
+lr: 2.0e-06
+lr_critic: 4.0e-07
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+ema_weight: 0.99
+ema_start_step: 200
+seed: 0
+sharding_strategy: no_shard
+data_path: /opt/dlami/nvme/chenxinyu/data/Universal-Edit-Metadata/mixed_train/index_rv2v_vvtshort_eevee_garment_dedup.json
+dataset_sampling_weights:
+  tripvvt: 5998
+  eevee: 9357
+dataset_max_lat_frames:
+  tripvvt: 15
+  eevee: 15
+negative_prompt: 色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走
+critic_sharding_strategy: full

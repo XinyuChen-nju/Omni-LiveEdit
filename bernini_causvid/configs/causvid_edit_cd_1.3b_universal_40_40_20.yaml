@@ -14,9 +14,12 @@ guidance_mode_by_task_type:
   t2v: t2v
   v2v: v2v_apg
   tv2v: v2v_apg
-  rv2v: rv2v_apg
+  rv2v: rv2v
 discrete_cd_N: 48
 guidance_scale: 3.0
+omega_v: 1.25
+omega_i: 4.5
+omega_ti: 4.0
 num_train_timestep: 1000
 generator_ckpt: /opt/dlami/nvme/chenxinyu/model/ckpt_ar_src_0_rigion2_16gpu/model-12000.pt
 image_or_video_shape:

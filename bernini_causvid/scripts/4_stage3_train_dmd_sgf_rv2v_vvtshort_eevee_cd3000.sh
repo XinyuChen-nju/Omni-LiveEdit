@@ -8,8 +8,8 @@ cd "$CF_ROOT"
 # Put this repository first so all ranks execute the files beside this launcher.
 export PYTHONPATH="$CF_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
-CONFIG="${CONFIG:-bernini_causvid/configs/causvid_edit_dmd_1.3b_rv2v_vvtshort_eevee_cd3000_sgf_rv2v_apg.yaml}"
-RUN_NAME="${RUN_NAME:-dmd_sgf_rv2v_vvtshort_eevee_cd3000_rv2v_apg}"
+CONFIG="${CONFIG:-bernini_causvid/configs/causvid_edit_dmd_1.3b_rv2v_vvtshort_eevee_cd3000_sgf_rv2v.yaml}"
+RUN_NAME="${RUN_NAME:-dmd_sgf_rv2v_vvtshort_eevee_cd2500_rv2v}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 LOGDIR="${LOGDIR:-runs/${RUN_NAME}/${TIMESTAMP}}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -22,7 +22,7 @@ SAVE_EVERY="${SAVE_EVERY:-250}"
 LOG_EVERY="${LOG_EVERY:-10}"
 SAMPLE_EVERY="${SAMPLE_EVERY:-250}"
 RESUME="${RESUME:-none}"
-GRAD_ACCUM="${GRAD_ACCUM:-1}"
+GRAD_ACCUM="${GRAD_ACCUM:-2}"
 
 RDZV_ARGS=(--nnodes="$NNODES" --node_rank="$NODE_RANK" \
            --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT")

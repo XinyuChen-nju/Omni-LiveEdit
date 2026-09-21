@@ -184,27 +184,30 @@ class EditSelfForcingTrainingPipeline:
                         f"[hook] blk{_b} backward REACHED generator output, "
                         f"grad_norm={g.detach().float().norm().item():.4e}", flush=True))
 
-            # refresh this block's clean K/V at context noise (no grad)
-            with torch.no_grad():
-                ctx_t = torch.full(
-                    [b, block_frames], float(self.context_noise),
-                    device=device, dtype=torch.float32,
-                )
-                ctx_in = self.scheduler.add_noise(
-                    denoised.detach().flatten(0, 1),
-                    torch.randn_like(denoised.flatten(0, 1)),
-                    torch.full(
-                        [b * block_frames], float(self.context_noise),
+            # Refresh clean K/V only when a later block will consume it. A trailing
+            # no-grad FSDP forward after the differentiable exit forward clears the
+            # pending backward state, and the last block's cache is never read again.
+            if blk < num_blocks - 1:
+                with torch.no_grad():
+                    ctx_t = torch.full(
+                        [b, block_frames], float(self.context_noise),
                         device=device, dtype=torch.float32,
-                    ),
-                ).unflatten(0, (b, block_frames))
-                self.generator(
-                    stream_mode="denoise_target",
-                    noisy_image_or_video=ctx_in, timestep=ctx_t,
-                    conditional_dict=conditional_dict,
-                    cond_kv_cache=cond_cache, tgt_kv_cache=tgt_cache,
-                    crossattn_cache=crossattn_cache,
-                    rope_start_frame=fs, current_tgt_start=cur_tgt_start)
+                    )
+                    ctx_in = self.scheduler.add_noise(
+                        denoised.detach().flatten(0, 1),
+                        torch.randn_like(denoised.flatten(0, 1)),
+                        torch.full(
+                            [b * block_frames], float(self.context_noise),
+                            device=device, dtype=torch.float32,
+                        ),
+                    ).unflatten(0, (b, block_frames))
+                    self.generator(
+                        stream_mode="denoise_target",
+                        noisy_image_or_video=ctx_in, timestep=ctx_t,
+                        conditional_dict=conditional_dict,
+                        cond_kv_cache=cond_cache, tgt_kv_cache=tgt_cache,
+                        crossattn_cache=crossattn_cache,
+                        rope_start_frame=fs, current_tgt_start=cur_tgt_start)
 
         # DMD timestep window aligned with the exit step (same convention as framework)
         final_exit = exit_flags[0] if self.same_step_across_blocks else exit_flags[-1]

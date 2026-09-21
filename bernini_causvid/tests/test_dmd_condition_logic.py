@@ -134,10 +134,10 @@ def test_resolve_guidance_modes_by_task_type():
     model.guidance_mode_by_task_type = {
         "t2v": "t2v",
         "v2v": "v2v_apg",
-        "rv2v": "rv2v_apg",
+        "rv2v": "rv2v",
     }
     modes = model._resolve_guidance_modes(["t2v", "rv2v", "v2v"])
-    assert modes == ["t2v", "rv2v_apg", "v2v_apg"]
+    assert modes == ["t2v", "rv2v", "v2v_apg"]
     try:
         model._resolve_guidance_modes(["t2v", ""])
         raise AssertionError("empty task_type should fail-fast")

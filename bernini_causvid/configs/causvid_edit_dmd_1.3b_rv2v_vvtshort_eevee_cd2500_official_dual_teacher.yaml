@@ -24,7 +24,7 @@ teacher_cpu_offload: true
 cache_text_embeds: true
 
 # ---- Stage 2 初始化 --------------------------------------------------------
-generator_ckpt: /opt/dlami/nvme/chenxinyu/project/Universal-Edit-Forcing/runs/cd_rv2v_vvtshort_eevee_ar3000_v2v_flow/20260915_134052/checkpoints/checkpoint_model_003000/model.pt
+generator_ckpt: /opt/dlami/nvme/chenxinyu/project/Universal-Edit-Forcing/runs/cd_rv2v_vvtshort_eevee_ar3000_v2v_flow/20260915_134052/checkpoints/checkpoint_model_002500/model.pt
 fake_score_init: teacher
 allow_raw_bernini_init: false
 
@@ -37,13 +37,13 @@ score_source_timestep_mode: target
 score_causal_source: false
 
 # ---- Bernini real-score guidance ------------------------------------------
-guidance_mode: v2v_apg
+guidance_mode: rv2v
 guidance_mode_by_task_type:
   t2v: t2v
   s2v: v2v_apg
   v2v: v2v_apg
   i2i: v2v_apg
-  rv2v: rv2v_apg
+  rv2v: rv2v
 guidance_scale: 3.0
 omega_v: 1.25
 omega_i: 4.5
@@ -51,12 +51,9 @@ omega_ti: 4.0
 apg_eta: 0.5
 apg_norm_threshold: 50.0
 
-# ---- DMD / Self-Forcing ---------------------------------------------------
+# ---- DMD ------------------------------------------------------------------
 distribution_loss: dmd
 trainer: score_distillation
-grad_mode: self_gradient_forcing
-self_gradient_forcing_cache_mode: exit
-self_gradient_forcing_match_context: true
 denoising_loss_type: flow
 denoising_step_list:
   - 1000
@@ -100,6 +97,9 @@ dataset_sampling_weights:
   tripvvt: 5998
   eevee: 9357
 dataset_max_lat_frames:
-  tripvvt: 21
+  tripvvt: 15
   eevee: 21
 negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+generator_sharding_strategy: full
+critic_sharding_strategy: full

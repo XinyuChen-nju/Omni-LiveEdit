@@ -302,22 +302,23 @@ class EditDMD(nn.Module):
         _, pred_fake = self.fake_score(
             noisy_image_or_video=noisy, conditional_dict=score_cond, timestep=timestep)
 
-        # real score (teacher): chained multi-condition guided x0
+        # real score (teacher): native Bernini-R four-condition RV2V guidance
         src, ref = self._split_cond(score_cond)
         task_types = conditional_dict.get("task_types")
         guidance_modes = (
             self._resolve_guidance_modes(task_types)
             if task_types is not None else None)
         if self.trace_teacher_guidance and not self._teacher_guidance_traced:
-            expected = ["rv2v_apg"] * len(guidance_modes or [])
+            expected = ["rv2v"] * len(guidance_modes or [])
             if guidance_modes != expected:
                 raise RuntimeError(
-                    "SGF smoke expected every teacher path to use rv2v_apg, "
+                    "SGF smoke expected every teacher path to use rv2v, "
                     f"got {guidance_modes}"
                 )
             print(
-                "[SGF_TRACE] teacher_guidance=rv2v_apg "
-                "flow_paths=x0_0->x0_v->x0_vi->x0_vti count=4",
+                "[SGF_TRACE] teacher_guidance=rv2v "
+                "conditions=f0->fV->fVI->fVTI "
+                "weights=omega_v/omega_i/omega_ti count=4",
                 flush=True,
             )
             self._teacher_guidance_traced = True

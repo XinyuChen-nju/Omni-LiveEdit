@@ -1,5 +1,6 @@
 # Stable training cases -> overseas cos_srv -> domestic COS -> data_srv Dataset.
 runs_root: /opt/dlami/nvme/chenxinyu/project/Universal-Edit-Forcing/runs
+causal_h3_runs_root: /opt/dlami/nvme/chenxinyu/project/CausalH3/runs
 cos_base_url: http://open-api-oversea.xrtm-infra.com
 data_srv_url: http://140.207.124.187
 dataset_name: universal-edit-training-eval
