@@ -1,0 +1,16 @@
+# Stage 1: autoregressive teacher-forcing training.
+
+teacher_forcing: true
+noise_augmentation_max_timestep: 100
+source_noise_max_timestep: 100
+source_timestep_mode: source
+ref_timestep: 0
+
+region_loss: false
+ref_attn_loss: false
+
+lr: 1.0e-5
+beta1: 0.9
+beta2: 0.999
+ema_weight: 0.0
+sharding_strategy: grad_op

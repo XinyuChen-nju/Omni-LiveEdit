@@ -1,0 +1,32 @@
+# Stage 3: asymmetric DMD with a causal generator, bidirectional critic, and
+# frozen Bernini teacher. The critic and teacher start from the model directories
+# configured in base.yaml; only the generator loads the Stage 2 checkpoint.
+
+generator_ckpt: ${oc.env:OMNILIVEEDIT_CD_CHECKPOINT,weights/checkpoints/cd/model.pt}
+fake_score_init: teacher
+allow_raw_bernini_init: false
+
+source_timestep_mode: target
+score_source_timestep_mode: target
+score_causal_source: false
+source_noise: 0
+context_noise: 0
+ref_timestep: 0
+
+ts_schedule: false
+min_score_timestep: 0
+generator_start_step: 0
+dfake_gen_update_ratio: 5
+
+lr: 2.0e-6
+lr_critic: 4.0e-7
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+ema_weight: 0.99
+ema_start_step: 200
+
+critic_sharding_strategy: full
+teacher_sharding_strategy: full
+teacher_cpu_offload: false

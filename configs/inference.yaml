@@ -1,0 +1,8 @@
+# Few-step causal inference. Keep this schedule aligned with the Stage 3 model.
+
+num_frame_per_block: 3
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+context_noise: 0
+source_noise: 0
+ref_timestep: 0

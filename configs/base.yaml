@@ -1,0 +1,72 @@
+# Shared defaults for Omni-LiveEdit training and inference.
+# Override paths with the environment variables documented in docs/WEIGHTS.md
+# and docs/DATA.md.
+
+model_name: Bernini-R-1.3B
+model_path: ${oc.env:OMNILIVEEDIT_MODEL_DIR,weights/models/Bernini-R-1.3B-Wan}
+teacher_model_name: Bernini-R-1.3B
+teacher_model_path: ${oc.env:OMNILIVEEDIT_TEACHER_DIR,weights/models/Bernini-R-1.3B-Wan}
+teacher_model_path_low: null
+text_encoder_path: ${oc.env:OMNILIVEEDIT_TEXT_ENCODER,weights/models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth}
+tokenizer_path: ${oc.env:OMNILIVEEDIT_TOKENIZER,weights/models/Wan2.1-T2V-1.3B/google/umt5-xxl}
+vae_path: ${oc.env:OMNILIVEEDIT_VAE,weights/models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth}
+
+causal: true
+num_frame_per_block: 3
+timestep_shift: 5.0
+num_train_timestep: 1000
+mixed_precision: true
+gradient_checkpointing: true
+cache_text_embeds: true
+
+# Fallback geometry [batch, latent frames, latent channels, latent height,
+# latent width]. Training uses each homogeneous batch's actual latent shape.
+image_or_video_shape: [1, 21, 16, 60, 104]
+
+data_path: ${oc.env:OMNILIVEEDIT_DATA_INDEX,data/index.json}
+dataset_max_lat_frames: null
+dataset_sampling_weights: null
+eval_samples: null
+negative_prompt_embed_path: ${oc.env:OMNILIVEEDIT_NEGATIVE_EMBED,data/negative_prompt_embed.pt}
+negative_prompt: >-
+  色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，
+  整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，
+  画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，
+  手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走
+
+batch_size: 1
+gradient_accumulation_steps: 1
+lr: 2.0e-6
+beta1: 0.0
+beta2: 0.999
+weight_decay: 0.0
+ema_weight: 0.99
+ema_start_step: 0
+seed: 0
+sharding_strategy: full
+
+generator_ckpt: null
+teacher_forcing: true
+source_timestep_mode: source
+source_noise: 0
+context_noise: 0
+ref_timestep: 0
+noise_augmentation_max_timestep: 0
+source_noise_max_timestep: 0
+
+guidance_mode: v2v_apg
+guidance_mode_by_task_type:
+  t2v: t2v
+  v2v: v2v_apg
+  tv2v: v2v_apg
+  rv2v: rv2v
+guidance_scale: 3.0
+omega_v: 1.25
+omega_i: 4.5
+omega_ti: 4.0
+apg_eta: 0.5
+apg_norm_threshold: 50.0
+
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+denoising_loss_type: flow

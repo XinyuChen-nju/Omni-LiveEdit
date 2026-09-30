@@ -1,0 +1,75 @@
+"""Shared run-directory / logging helpers for the bernini_causvid training stages."""
+
+import glob
+import json
+import os
+import re
+from datetime import datetime
+
+
+def find_latest(ckpt_dir):
+    """Prefer newest verified checkpoint; skip corrupt incomplete saves."""
+    try:
+        from bernini_causvid.train_state import find_latest_verified
+
+        path, step, reason = find_latest_verified(ckpt_dir)
+        if path is None:
+            return None, None
+        if reason == "legacy_no_manifest":
+            print(f"[ckpt] using legacy checkpoint without manifest: {path}")
+        return path, step
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ckpt] verified lookup failed ({exc}); falling back to existence scan")
+        return _find_latest_legacy(ckpt_dir)
+
+
+def _find_latest_legacy(ckpt_dir):
+    """Return (path_to_model.pt, step) of the latest checkpoint, or (None, None)."""
+    best, path = None, None
+    for d in glob.glob(os.path.join(ckpt_dir, "checkpoint_model_*")):
+        m = re.search(r"checkpoint_model_(\d+)$", d)
+        pt = os.path.join(d, "model.pt")
+        if m and os.path.exists(pt):
+            s = int(m.group(1))
+            if best is None or s > best:
+                best, path = s, pt
+    return path, best
+
+
+class Logger:
+    """Tee stdout-style logging to console and <run_dir>/train.log.
+
+    Under distributed training only the main process (rank 0) should log, so pass
+    `is_main=False` on the other ranks to make every call a no-op.
+    """
+
+    def __init__(self, log_path, is_main=True):
+        self.is_main = is_main
+        self.fh = open(log_path, "a", buffering=1) if is_main else None
+
+    def __call__(self, msg):
+        if not self.is_main:
+            return
+        line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
+        print(line, flush=True)
+        self.fh.write(line + "\n")
+
+    def close(self):
+        if self.fh is not None:
+            self.fh.close()
+
+
+def append_jsonl(path, record):
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def cycle(loader):
+    """Yield batches forever and advance epoch-aware samplers."""
+    sampler = getattr(loader, "sampler", None)
+    epoch = 0
+    while True:
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+        yield from loader
+        epoch += 1

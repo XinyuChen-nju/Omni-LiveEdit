@@ -1,0 +1,19 @@
+# Stage 2: consistency distillation from the Stage 1 checkpoint.
+
+generator_ckpt: ${oc.env:OMNILIVEEDIT_AR_CHECKPOINT,weights/checkpoints/ar/model.pt}
+teacher_forcing: true
+source_timestep_mode: source
+ref_timestep: 0
+discrete_cd_N: 48
+
+guidance_mode_by_task_type:
+  t2v: t2v
+  v2v: v2v_apg
+  tv2v: v2v_apg
+  rv2v: rv2v
+
+lr: 2.0e-6
+beta1: 0.0
+beta2: 0.999
+ema_weight: 0.99
+ema_start_step: 0

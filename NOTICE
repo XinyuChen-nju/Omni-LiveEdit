@@ -1,0 +1,27 @@
+Omni-LiveEdit
+
+This distribution includes or adapts components from the following projects:
+
+- Bernini / Bernini-R (ByteDance)
+  https://github.com/bytedance/Bernini
+
+- Causal Forcing and Causal Forcing++
+  https://github.com/thu-ml/Causal-Forcing
+
+- CausVid
+  https://github.com/tianweiy/CausVid
+
+- Self-Forcing
+  https://github.com/guandeh17/Self-Forcing
+
+- Wan2.1
+  Copyright 2024-2025 The Alibaba Wan Team Authors
+  https://github.com/Wan-Video/Wan2.1
+
+Individual source files retain more specific copyright and provenance notices,
+including notices for Hugging Face Diffusers, OpenAI CLIP, OpenCLIP, and
+qwen-vl-utils-derived code.
+
+Model weights, tokenizers, datasets, and generated artifacts are not distributed
+under this repository's Apache License 2.0. Their upstream terms continue to
+apply.
